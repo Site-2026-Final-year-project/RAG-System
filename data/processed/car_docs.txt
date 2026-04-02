@@ -1,0 +1,5 @@
+Engine oil warning light indicates low oil pressure. Stop the car immediately.
+ABS warning light indicates an issue with the anti-lock braking system.
+Manual transmission vehicles require clutch operation when changing gears.
+Automatic transmission shifts gears without driver intervention.
+

@@ -1,0 +1,8 @@
+# Pinned stack: transformers 5 + huggingface-hub 1.x pulls `hf-xet` (extra native wheel).
+# On slow/unstable networks pip may report that as a hash mismatch. Hub <0.32 avoids hf-xet
+# while staying compatible with this RAG MVP (embeddings + TinyLlama).
+torch==2.2.2
+transformers==4.44.2
+sentence-transformers==3.0.1
+huggingface-hub==0.31.4
+faiss-cpu==1.8.0.post1
