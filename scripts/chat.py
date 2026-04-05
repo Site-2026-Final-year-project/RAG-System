@@ -1,13 +1,27 @@
 from __future__ import annotations
 
 import os
+import warnings
 from typing import List
+
+# Must run before importing torch/numpy/faiss: duplicate OpenMP runtimes often segfault on macOS.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+import torch
+
+torch.set_num_threads(1)
 
 import faiss
 import numpy as np
-import torch
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+warnings.filterwarnings(
+    "ignore",
+    message=".*clean_up_tokenization_spaces.*",
+    category=FutureWarning,
+)
 
 INDEX_PATH = "models/faiss_index"
 DOCS_PATH = "models/docs.txt"
@@ -33,33 +47,47 @@ def load_faiss_and_docs() -> tuple[faiss.Index, List[str]]:
     return index, docs
 
 
-def get_device() -> str:
-    # On Apple Silicon, MPS is often available and faster than CPU.
+def get_llm_device() -> str:
+    """Pick device for the causal LM. Apple GPU off by default — TinyLlama + MPS often segfaults."""
+    if torch.cuda.is_available():
+        return "cuda"
     if torch.backends.mps.is_available():
-        return "mps"
+        if os.environ.get("RAG_USE_MPS", "").lower() in ("1", "true", "yes"):
+            return "mps"
+        return "cpu"
     return "cpu"
 
 
 def main() -> None:
-    embed_model = SentenceTransformer(EMBEDDING_MODEL)
-    index, docs = load_faiss_and_docs()
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-    device = get_device()
-    print(f"Using device: {device}")
+    device = get_llm_device()
+    if torch.backends.mps.is_available() and device == "cpu":
+        print("Using device: cpu (LLM; MPS off by default — set RAG_USE_MPS=1 to try Apple GPU)")
+    else:
+        print(f"Using device: {device}")
 
-    # Load a small LLM (download on first run).
-    tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL)
+    # Load LLM before SentenceTransformer + FAISS to reduce native-library init clashes on macOS.
+    tokenizer = AutoTokenizer.from_pretrained(
+        LLM_MODEL,
+        clean_up_tokenization_spaces=False,
+    )
 
-    torch_dtype = None
-    if device in ("mps", "cuda"):
+    if device == "cuda":
         torch_dtype = torch.float16
+    elif device == "mps":
+        torch_dtype = torch.float32
+    else:
+        torch_dtype = None
 
     llm = AutoModelForCausalLM.from_pretrained(
         LLM_MODEL,
         torch_dtype=torch_dtype,
-        low_cpu_mem_usage=True,
     ).to(device)
     llm.eval()
+
+    embed_model = SentenceTransformer(EMBEDDING_MODEL)
+    index, docs = load_faiss_and_docs()
 
     def retrieve(query: str, k: int = 3) -> List[str]:
         q_emb = embed_model.encode(
