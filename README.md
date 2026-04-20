@@ -15,6 +15,35 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### Postgres + pgvector (Docker)
+
+Use this if local Homebrew Postgres and `pgvector` versions do not match.
+
+```bash
+docker compose up -d
+export DATABASE_URL="postgresql+psycopg://postgres:root@localhost:5433/fyp"
+```
+
+- **Port 5433** on the host maps to **5432** in the container (see `docker-compose.yml`). Change the left side if 5433 is already in use.
+- On first start with an empty volume, `docker/initdb/01-vector.sql` runs `CREATE EXTENSION vector`.
+- **driver-garage-backend:** set the same `DATABASE_URL` (same host, port, db `fyp`, user/password) in `.env` so Prisma and the RAG app share one database.
+- Reset container data (destructive): `docker compose down -v && docker compose up -d`
+
+#### Single database for Prisma + RAG (Option B)
+
+Use one Postgres for Express (Prisma) and this repo. Do **not** set `PRISMA_DATABASE_URL` here.
+
+1. Start Docker: `docker compose up -d`.
+2. In **driver-garage-backend** `.env`, point Prisma at the same instance. Prisma expects a `postgresql://` URL (no `+psycopg`), for example:
+   `DATABASE_URL="postgresql://postgres:root@localhost:5433/fyp"`
+3. From the **driver-garage-backend** root, apply the schema so tables such as `"EducationContent"` exist:
+   `npx prisma migrate deploy`  
+   (or `npx prisma db push` if you intentionally use push in dev.)
+4. In **RAG-System**, keep the Python URL form with the **psycopg** driver, e.g.  
+   `export DATABASE_URL="postgresql+psycopg://postgres:root@localhost:5433/fyp"`  
+   Leave `PRISMA_DATABASE_URL` unset.
+5. Build the global KB and sync manuals as usual (`python scripts/build_index.py`, then `python scripts/sync_education_manuals.py` with `EXPRESS_PROJECT_ROOT` if you read PDFs from disk).
+
 ## Step 1: Build the FAISS index
 
 ```bash
@@ -34,4 +63,93 @@ python scripts/chat.py
 Try asking:
 - `What does engine oil warning mean?`
 - `What does ABS warning light mean?`
+
+## Chat History API (for Flutter)
+
+Run the API server:
+
+```bash
+uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+```
+
+By default, chat history is stored in SQLite at `models/chat_history.db`.
+To use Postgres instead, set `DATABASE_URL`:
+
+```bash
+export DATABASE_URL="postgresql+psycopg://postgres:postgres@localhost:5432/rag_chat"
+uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### Authentication
+
+User identity comes from a JWT (recommended for Flutter production), not from the request body.
+
+- Set `JWT_SECRET` (HS256 by default). Send `Authorization: Bearer <token>` where the payload includes `"sub": "<your-user-id>"`.
+- Optional: `JWT_ALGORITHM` (default `HS256`), `JWT_AUDIENCE`, `JWT_ISSUER` if you issue tokens with those claims.
+- **Local dev** (no `JWT_SECRET`): send header `X-User-Id: user1` instead. Do not deploy without `JWT_SECRET` if the API is exposed.
+
+### Endpoints
+
+- `POST /sessions`
+  - body: `{ "title": "My chat", "car_context": "Toyota Vios 2021" }`
+  - `user_id` is taken from JWT `sub` (or `X-User-Id` in dev).
+- `GET /sessions` — list sessions for the authenticated user
+- `GET /sessions/{session_id}` — session metadata (404 if not yours)
+- `DELETE /sessions/{session_id}` — delete session and all messages (204 No Content)
+- `GET /sessions/{session_id}/messages?limit=50&before=<cursor>`
+  - First page: omit `before` to load the **latest** `limit` messages (chronological order in `items`).
+  - Older messages: pass `before` from the previous response’s `next_before` until `has_more` is false.
+- `POST /sessions/{session_id}/messages`
+  - body: `{ "message": "What does ABS light mean?", "car_context": "", "use_user_manual": true }`
+
+The `POST /sessions/{session_id}/messages` endpoint:
+1. stores the user message,
+2. runs the RAG assistant,
+3. stores the assistant answer,
+4. returns both messages.
+
+## Knowledge base: PostgreSQL + pgvector (Express admin DB)
+
+Retrieval no longer requires local FAISS files when `DATABASE_URL` points at **PostgreSQL** with the **`vector`** extension. Chunks live in **`rag_kb_chunks`** (same DB your Express app can use for manual uploads).
+
+- **Env**
+  - `DATABASE_URL=postgresql+psycopg://user:pass@host:5432/dbname`
+  - `RAG_KB_BACKEND=auto` (default): use pgvector when URL is Postgres; use local FAISS when URL is SQLite/file.
+  - `RAG_KB_BACKEND=faiss`: always use `models/faiss_index` + `models/docs.txt` (offline / no Postgres).
+  - `RAG_KB_BACKEND=pgvector`: require Postgres + tables (fails fast if URL is not Postgres).
+
+- **Schema** (reference SQL): `docs/schema_rag_pgvector.sql`  
+  SQLAlchemy also creates compatible tables on startup when using Postgres.
+
+- **Sync global KB from this repo** (embeds + upserts global rows):
+
+```bash
+export DATABASE_URL="postgresql+psycopg://..."
+python scripts/build_index.py
+```
+
+- **Sync a user PDF** (or use `--manual-id <uuid>` to link an Express `manuals.id`):
+
+```bash
+python scripts/upload_manual.py --pdf path/to/manual.pdf --user-id <sub-from-jwt>
+```
+
+Express can store uploaded files and metadata; either **ETL text into `rag_kb_chunks`** and run a small embed worker, or **call/trigger** the Python scripts above after upload.
+
+### driver-garage-backend: index admin `MANUALS` (Education CRUD)
+
+Express stores PDFs under `uploads/education-manuals/` and saves public URLs in `EducationContent.pdf_url` (Prisma). The RAG repo can index those into `rag_kb_chunks` (same Postgres, `manual_id` = education row UUID).
+
+```bash
+export DATABASE_URL="postgresql+psycopg://..."   # same DB as Express .env
+export EXPRESS_PROJECT_ROOT="/path/to/driver-garage-backend"
+python scripts/sync_education_manuals.py
+# one item:
+python scripts/sync_education_manuals.py --content-id <EducationContent.id>
+```
+
+- **`EXPRESS_PROJECT_ROOT`**: absolute path to the Express repo so PDFs are read from disk (`uploads/education-manuals/<file>`). If files are not on this machine, the script tries **HTTP GET** on `pdf_url` (Express must be running and serving `/uploads`).
+- Re-run sync after admins add or replace a manual PDF.
+
+Optional Express checklist / Cursor prompt: `docs/EXPRESS_RAG_PROMPT.md`.
 

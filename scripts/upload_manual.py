@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import sys
 from pathlib import Path
+from uuid import uuid4
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 import faiss
 import numpy as np
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
+
+from database import RagKbChunkModel, RagUserProfileModel, SessionLocal
+from rag_kb import delete_user_chunks, kb_pgvector_enabled
 
 MODEL = "all-MiniLM-L6-v2"
 
@@ -47,8 +57,48 @@ def chunk_text(text: str, size: int = 200) -> list[str]:
     return [" ".join(words[i : i + size]) for i in range(0, len(words), size)]
 
 
+def _use_postgres_for_kb() -> bool:
+    if os.environ.get("RAG_KB_BACKEND", "auto").lower().strip() == "faiss":
+        return False
+    return kb_pgvector_enabled()
+
+
+def _sync_user_to_postgres(
+    user_id: str,
+    chunks: list[str],
+    embeddings: np.ndarray,
+    model_name: str,
+    manual_id: str | None,
+) -> None:
+    with SessionLocal() as db:
+        delete_user_chunks(db, user_id)
+        for i, text in enumerate(chunks):
+            emb = embeddings[i].astype(np.float64).flatten().tolist()
+            db.add(
+                RagKbChunkModel(
+                    id=str(uuid4()),
+                    scope="user",
+                    owner_user_id=user_id,
+                    manual_id=manual_id,
+                    chunk_index=i,
+                    content=text,
+                    embedding=emb,
+                    embedding_model=MODEL,
+                )
+            )
+        row = db.get(RagUserProfileModel, user_id)
+        if row is None:
+            db.add(RagUserProfileModel(user_id=user_id, vehicle_meta=model_name))
+        else:
+            row.vehicle_meta = model_name
+        db.commit()
+
+
 def build_user_index(
-    pdf_path: Path, user_id: str = "user1", chunk_words: int = 200
+    pdf_path: Path,
+    user_id: str = "user1",
+    chunk_words: int = 200,
+    manual_id: str | None = None,
 ) -> dict[str, str | int]:
     if not pdf_path.is_file():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
@@ -65,14 +115,25 @@ def build_user_index(
     model_name = detect_car_model(text)
     print(f"Detected car model: {model_name}")
 
-    model = SentenceTransformer(MODEL)
-    embeddings = model.encode(
+    st_model = SentenceTransformer(MODEL)
+    embeddings = st_model.encode(
         chunks,
         convert_to_numpy=True,
         normalize_embeddings=False,
         show_progress_bar=True,
     )
     embeddings = embeddings.astype(np.float32)
+
+    if _use_postgres_for_kb():
+        print("Writing user manual chunks to PostgreSQL (rag_kb_chunks, scope=user)...")
+        _sync_user_to_postgres(user_id, chunks, embeddings, model_name, manual_id)
+        print(f"User manual indexed in DB for user_id='{user_id}'")
+        return {
+            "user_id": user_id,
+            "model_name": model_name,
+            "chunks": len(chunks),
+            "backend": "postgres",
+        }
 
     dim = embeddings.shape[1]
     index = faiss.IndexFlatL2(dim)
@@ -98,17 +159,28 @@ def build_user_index(
         "chunks": len(chunks),
         "index_path": str(user_dir / "faiss_index"),
         "docs_path": str(user_dir / "docs.txt"),
+        "backend": "faiss",
     }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build a user-specific FAISS index from a manual PDF.")
+    parser = argparse.ArgumentParser(description="Build a user-specific KB from a manual PDF.")
     parser.add_argument("--pdf", type=Path, required=True, help="Path to manual PDF")
-    parser.add_argument("--user-id", default="user1", help="User id (writes to models/<user-id>/...)")
+    parser.add_argument("--user-id", default="user1", help="User id (Postgres owner_user_id or models/<id>/)")
     parser.add_argument("--chunk-words", type=int, default=200, help="Words per chunk")
+    parser.add_argument(
+        "--manual-id",
+        default=None,
+        help="Optional UUID of manual row from Express DB (stored on rag_kb_chunks.manual_id)",
+    )
     args = parser.parse_args()
 
-    build_user_index(args.pdf, user_id=args.user_id, chunk_words=args.chunk_words)
+    build_user_index(
+        args.pdf,
+        user_id=args.user_id,
+        chunk_words=args.chunk_words,
+        manual_id=args.manual_id,
+    )
 
 
 if __name__ == "__main__":

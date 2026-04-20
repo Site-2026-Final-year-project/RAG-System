@@ -1,0 +1,21 @@
+# Postgres + pgvector (no local Homebrew version conflicts).
+# Start: docker compose up -d
+# Host port 5433 avoids clashing with local Homebrew Postgres on 5432.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: rag-fyp-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: root
+      POSTGRES_DB: fyp
+    ports:
+      - "5433:5432"
+    volumes:
+      - fyp_pgdata:/var/lib/postgresql/data
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+
+volumes:
+  fyp_pgdata:

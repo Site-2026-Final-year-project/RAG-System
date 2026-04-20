@@ -1,0 +1,177 @@
+"""Shared SQLAlchemy models and engine for chat history + pgvector knowledge base."""
+
+from __future__ import annotations
+
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engine, event
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+except ImportError:
+    pass
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./models/chat_history.db")
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def is_postgres_url(url: str) -> bool:
+    return url.startswith("postgresql://") or url.startswith("postgresql+psycopg://")
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class ChatSessionModel(Base):
+    __tablename__ = "chat_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(128), index=True)
+    title: Mapped[str] = mapped_column(String(255), default="New chat")
+    car_context: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class ChatMessageModel(Base):
+    __tablename__ = "chat_messages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    session_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"),
+        index=True,
+    )
+    role: Mapped[str] = mapped_column(String(16))
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+# --- Knowledge base (PostgreSQL + pgvector only; tables created only on Postgres) ---
+
+from pgvector.sqlalchemy import Vector
+
+
+EMBEDDING_DIM = 384  # all-MiniLM-L6-v2
+
+
+class RagKbChunkModel(Base):
+    """Chunks + embeddings. Align Express uploads with this table or ETL into it."""
+
+    __tablename__ = "rag_kb_chunks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    scope: Mapped[str] = mapped_column(String(16), index=True)  # "global" | "user"
+    owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    manual_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    chunk_index: Mapped[int] = mapped_column(Integer, default=0)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[Any] = mapped_column(Vector(EMBEDDING_DIM), nullable=False)
+    embedding_model: Mapped[str] = mapped_column(String(128), default="all-MiniLM-L6-v2")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class RagUserProfileModel(Base):
+    """Optional vehicle hint per user (replaces models/<user>/meta.txt when using Postgres)."""
+
+    __tablename__ = "rag_user_profile"
+
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    vehicle_meta: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+engine = create_engine(
+    DATABASE_URL,
+    future=True,
+    pool_pre_ping=True,
+)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+
+# Optional second Postgres URL for Prisma tables (e.g. EducationContent) when the RAG stack
+# uses a different database than driver-garage-backend (Docker pgvector vs local Express DB).
+PRISMA_DATABASE_URL = os.environ.get("PRISMA_DATABASE_URL", "").strip()
+_prisma_engine = None
+PrismaSessionLocal: sessionmaker | None = None
+
+
+def _ensure_prisma_engine() -> None:
+    global _prisma_engine, PrismaSessionLocal
+    if not PRISMA_DATABASE_URL or _prisma_engine is not None:
+        return
+    if not is_postgres_url(PRISMA_DATABASE_URL):
+        raise ValueError("PRISMA_DATABASE_URL must be a PostgreSQL URL when set.")
+    _prisma_engine = create_engine(
+        PRISMA_DATABASE_URL,
+        future=True,
+        pool_pre_ping=True,
+    )
+    PrismaSessionLocal = sessionmaker(
+        bind=_prisma_engine, autoflush=False, autocommit=False, expire_on_commit=False
+    )
+
+
+def session_for_prisma_reads():
+    """DB session for Prisma-managed tables. Uses PRISMA_DATABASE_URL if set, else DATABASE_URL."""
+    if PRISMA_DATABASE_URL:
+        _ensure_prisma_engine()
+        assert PrismaSessionLocal is not None
+        return PrismaSessionLocal()
+    return SessionLocal()
+
+
+@event.listens_for(engine, "connect")
+def _sqlite_enable_foreign_keys(dbapi_connection: Any, _connection_record: Any) -> None:
+    if DATABASE_URL.startswith("sqlite:"):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+
+@event.listens_for(engine, "connect")
+def _postgres_enable_vector(dbapi_connection: Any, _connection_record: Any) -> None:
+    if not is_postgres_url(DATABASE_URL):
+        return
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        dbapi_connection.commit()
+    except Exception:
+        dbapi_connection.rollback()
+        raise
+    finally:
+        cursor.close()
+
+
+def create_all_tables() -> None:
+    """Create chat tables always; KB tables only when Postgres + pgvector is available."""
+    if is_postgres_url(DATABASE_URL) and Vector is not None:
+        Base.metadata.create_all(
+            engine,
+            tables=[
+                ChatSessionModel.__table__,
+                ChatMessageModel.__table__,
+                RagKbChunkModel.__table__,
+                RagUserProfileModel.__table__,
+            ],
+        )
+    else:
+        Base.metadata.create_all(
+            engine,
+            tables=[
+                ChatSessionModel.__table__,
+                ChatMessageModel.__table__,
+            ],
+        )
+
+
+create_all_tables()
