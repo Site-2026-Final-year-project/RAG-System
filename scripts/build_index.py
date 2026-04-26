@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 import os
+import sys
 import warnings
+from pathlib import Path
+from uuid import uuid4
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -20,11 +27,53 @@ warnings.filterwarnings(
     category=FutureWarning,
 )
 
+from database import RagKbChunkModel, SessionLocal
+from rag_kb import delete_global_chunks, kb_pgvector_enabled
+
 DATA_PATH = "data/processed/unified_docs.txt"
 INDEX_PATH = "models/faiss_index"
 DOCS_OUT_PATH = "models/docs.txt"
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+
+
+def _write_faiss(docs: list[str], embeddings: np.ndarray) -> None:
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(embeddings)
+
+    os.makedirs("models", exist_ok=True)
+    faiss.write_index(index, INDEX_PATH)
+
+    with open(DOCS_OUT_PATH, "w", encoding="utf-8") as f:
+        for d in docs:
+            f.write(d + "\n")
+
+
+def _sync_global_to_postgres(docs: list[str], embeddings: np.ndarray) -> None:
+    with SessionLocal() as db:
+        delete_global_chunks(db)
+        for i, text in enumerate(docs):
+            emb = embeddings[i].astype(np.float64).flatten().tolist()
+            db.add(
+                RagKbChunkModel(
+                    id=str(uuid4()),
+                    scope="global",
+                    owner_user_id=None,
+                    manual_id=None,
+                    chunk_index=i,
+                    content=text,
+                    embedding=emb,
+                    embedding_model=EMBEDDING_MODEL,
+                )
+            )
+        db.commit()
+
+
+def _use_postgres_for_kb() -> bool:
+    if os.environ.get("RAG_KB_BACKEND", "auto").lower().strip() == "faiss":
+        return False
+    return kb_pgvector_enabled()
 
 
 def main() -> None:
@@ -52,22 +101,17 @@ def main() -> None:
     )
     embeddings = embeddings.astype(np.float32)
 
-    dimension = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dimension)
-    index.add(embeddings)
-
-    os.makedirs("models", exist_ok=True)
-    faiss.write_index(index, INDEX_PATH)
-
-    with open(DOCS_OUT_PATH, "w", encoding="utf-8") as f:
-        for d in docs:
-            f.write(d + "\n")
-
-    print("Index built successfully!")
-    print(f"- FAISS index: {INDEX_PATH}")
-    print(f"- Stored docs : {DOCS_OUT_PATH}")
+    if _use_postgres_for_kb():
+        print("Writing global KB to PostgreSQL (rag_kb_chunks, scope=global)...")
+        _sync_global_to_postgres(docs, embeddings)
+        print("PostgreSQL sync OK.")
+    else:
+        print("Writing FAISS index + models/docs.txt ...")
+        _write_faiss(docs, embeddings)
+        print("Index built successfully!")
+        print(f"- FAISS index: {INDEX_PATH}")
+        print(f"- Stored docs : {DOCS_OUT_PATH}")
 
 
 if __name__ == "__main__":
     main()
-

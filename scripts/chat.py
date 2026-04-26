@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import warnings
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List
+import re
+
+# Repo root on sys.path (so `database` / `rag_kb` resolve when running as `python scripts/chat.py`).
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 # Must run before importing torch/numpy/faiss: duplicate OpenMP runtimes often segfault on macOS.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -19,6 +27,9 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from database import RagUserProfileModel, SessionLocal
+from rag_kb import count_user_chunks, kb_pgvector_enabled, search_kb_l2
+
 warnings.filterwarnings(
     "ignore",
     message=".*clean_up_tokenization_spaces.*",
@@ -29,7 +40,29 @@ INDEX_PATH = "models/faiss_index"
 DOCS_PATH = "models/docs.txt"
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-LLM_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+LLM_MODEL = os.environ.get("RAG_LLM_MODEL", "Qwen/Qwen2.5-3B-Instruct").strip()
+FALLBACK_LLM_MODEL = os.environ.get(
+    "RAG_FALLBACK_LLM_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+).strip()
+
+# Increase Hub network timeouts to reduce transient download failures.
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
+
+
+def use_pgvector_for_kb() -> bool:
+    """auto: Postgres URL -> pgvector; faiss: local FAISS files; pgvector: force DB (must be Postgres)."""
+    backend = os.environ.get("RAG_KB_BACKEND", "auto").lower().strip()
+    if backend == "faiss":
+        return False
+    if backend == "pgvector":
+        if not kb_pgvector_enabled():
+            raise RuntimeError(
+                "RAG_KB_BACKEND=pgvector requires DATABASE_URL to be a PostgreSQL URL "
+                "(same DB as Express + pgvector extension)."
+            )
+        return True
+    return kb_pgvector_enabled()
 
 
 def load_faiss_and_docs(index_path: str, docs_path: str) -> tuple[faiss.Index, List[str]]:
@@ -70,6 +103,12 @@ def load_user_index(user_id: str) -> tuple[faiss.Index | None, List[str]]:
 
 
 def load_user_meta(user_id: str) -> str:
+    if use_pgvector_for_kb():
+        with SessionLocal() as db:
+            row = db.get(RagUserProfileModel, user_id)
+            if row and (row.vehicle_meta or "").strip():
+                return row.vehicle_meta.strip()
+        return ""
     meta_path = os.path.join("models", user_id, "meta.txt")
     if not os.path.exists(meta_path):
         return ""
@@ -78,7 +117,7 @@ def load_user_meta(user_id: str) -> str:
 
 
 def get_llm_device() -> str:
-    """Pick device for the causal LM. Apple GPU off by default — TinyLlama + MPS often segfaults."""
+    """Pick device for the causal LM."""
     if torch.cuda.is_available():
         return "cuda"
     if torch.backends.mps.is_available():
@@ -104,6 +143,9 @@ class RAGAssistant:
     ) -> None:
         self.user_id = user_id
         self.car_context = car_context.strip()
+        self._use_user_manual = use_user_manual
+        self._use_pgvector = use_pgvector_for_kb()
+
         if use_user_manual:
             self.user_model = load_user_meta(user_id)
         else:
@@ -112,31 +154,58 @@ class RAGAssistant:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         self.device = get_llm_device()
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            LLM_MODEL,
-            clean_up_tokenization_spaces=False,
-        )
         if self.device == "cuda":
             torch_dtype = torch.float16
         elif self.device == "mps":
             torch_dtype = torch.float32
         else:
             torch_dtype = None
-        self.llm = AutoModelForCausalLM.from_pretrained(
-            LLM_MODEL,
-            torch_dtype=torch_dtype,
-        ).to(self.device)
-        self.llm.eval()
+
+        self.active_llm_model = ""
+        load_errors: List[str] = []
+        for candidate_model in [LLM_MODEL, FALLBACK_LLM_MODEL]:
+            if not candidate_model or candidate_model in {self.active_llm_model}:
+                continue
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    candidate_model,
+                    clean_up_tokenization_spaces=False,
+                )
+                if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
+                    self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+                self.llm = AutoModelForCausalLM.from_pretrained(
+                    candidate_model,
+                    torch_dtype=torch_dtype,
+                ).to(self.device)
+                self.llm.eval()
+                self.active_llm_model = candidate_model
+                break
+            except Exception as e:  # pragma: no cover - runtime/network dependent
+                load_errors.append(f"{candidate_model}: {e}")
+
+        if not self.active_llm_model:
+            msg = " | ".join(load_errors) if load_errors else "Unknown model loading failure"
+            raise RuntimeError(f"Failed to load any LLM model. {msg}")
 
         self.embed_model = SentenceTransformer(EMBEDDING_MODEL)
-        self.global_index, self.global_docs = load_global_index()
-        if use_user_manual:
-            self.user_index, self.user_docs = load_user_index(user_id)
+
+        if self._use_pgvector:
+            self.global_index = None
+            self.global_docs = []
+            self.user_index = None
+            self.user_docs = []
         else:
-            self.user_index, self.user_docs = None, []
+            self.global_index, self.global_docs = load_global_index()
+            if use_user_manual:
+                self.user_index, self.user_docs = load_user_index(user_id)
+            else:
+                self.user_index, self.user_docs = None, []
 
     @property
     def has_user_index(self) -> bool:
+        if self._use_pgvector:
+            with SessionLocal() as db:
+                return count_user_chunks(db, self.user_id) > 0
         return self.user_index is not None and bool(self.user_docs)
 
     def _search(self, index: faiss.Index, docs: List[str], q_emb: np.ndarray, k: int) -> List[str]:
@@ -147,30 +216,76 @@ class RAGAssistant:
                 results.append(docs[i])
         return results
 
+    def _embed_query(self, text: str) -> np.ndarray:
+        return self.embed_model.encode(
+            [text],
+            convert_to_numpy=True,
+            normalize_embeddings=False,
+        ).astype(np.float32)
+
+    def _retrieve_once(self, q_emb: np.ndarray, config: RetrievalConfig) -> tuple[List[str], List[str]]:
+        user_results: List[str] = []
+        global_results: List[str] = []
+        if self._use_pgvector:
+            with SessionLocal() as db:
+                if self._use_user_manual:
+                    user_results = search_kb_l2(
+                        db,
+                        scope="user",
+                        owner_user_id=self.user_id,
+                        query_embedding=q_emb,
+                        k=config.k_user,
+                    )
+                global_results = search_kb_l2(
+                    db,
+                    scope="global",
+                    owner_user_id=None,
+                    query_embedding=q_emb,
+                    k=config.k_global,
+                )
+        else:
+            if self.user_index is not None and self.user_docs:
+                user_results = self._search(self.user_index, self.user_docs, q_emb, config.k_user)
+            global_results = self._search(self.global_index, self.global_docs, q_emb, config.k_global)
+        return user_results, global_results
+
     def retrieve(
-        self, query: str, config: RetrievalConfig | None = None, car_context: str = ""
+        self,
+        query: str,
+        config: RetrievalConfig | None = None,
+        car_context: str = "",
+        priority_context: str = "",
     ) -> List[str]:
         config = config or RetrievalConfig()
         ctx = car_context.strip() if car_context.strip() else self.car_context
         if self.user_model and not ctx:
             ctx = self.user_model
 
-        search_query = f"{ctx} {query}".strip() if ctx else query
-        q_emb = self.embed_model.encode(
-            [search_query],
-            convert_to_numpy=True,
-            normalize_embeddings=False,
-        ).astype(np.float32)
-
-        user_results: List[str] = []
-        if self.user_index is not None and self.user_docs:
-            user_results = self._search(self.user_index, self.user_docs, q_emb, config.k_user)
-        global_results = self._search(self.global_index, self.global_docs, q_emb, config.k_global)
+        # Priority order:
+        # 1) Health + vehicle context + query (diagnostic first)
+        # 2) Vehicle context + query (manual/model-targeted retrieval)
+        # 3) Raw query only (general fallback)
+        candidate_queries: List[str] = []
+        if priority_context.strip():
+            candidate_queries.append(f"{priority_context.strip()} {ctx} {query}".strip())
+        if ctx:
+            candidate_queries.append(f"{ctx} {query}".strip())
+        candidate_queries.append(query.strip())
 
         merged: List[str] = []
-        for c in user_results + global_results:
-            if c and c not in merged:
-                merged.append(c)
+        seen_queries: set[str] = set()
+        for q in candidate_queries:
+            if not q or q in seen_queries:
+                continue
+            seen_queries.add(q)
+            q_emb = self._embed_query(q)
+            user_results, global_results = self._retrieve_once(q_emb, config)
+            for c in user_results + global_results:
+                if c and c not in merged:
+                    merged.append(c)
+            if len(merged) >= (config.k_user + config.k_global):
+                break
+
         return merged
 
     def _answer_mode(self, query: str) -> str:
@@ -182,6 +297,24 @@ class RAGAssistant:
         if any(h in q for h in simple_hints):
             return "simple"
         return "simple"
+
+    def _quick_smalltalk(self, query: str) -> str | None:
+        q = query.strip().lower()
+        q_alpha = re.sub(r"[^a-z\s]", "", q)
+        greetings = {"hi", "hello", "hey", "yo", "hii", "helo"}
+        thanks = {"thanks", "thank you", "thx", "ty"}
+        bye = {"bye", "goodbye", "see you"}
+
+        if q in greetings or q_alpha in greetings:
+            return (
+                "Hi! I can help with your vehicle health, symptoms, and manual-based guidance. "
+                "Tell me what issue you are seeing."
+            )
+        if q in thanks or q_alpha in thanks:
+            return "You are welcome. If you want, share your car issue and I will help step by step."
+        if q in bye or q_alpha in bye:
+            return "Goodbye. Drive safe!"
+        return None
 
     def _build_prompt(self, context: str, query: str, mode: str) -> str:
         if mode == "technical":
@@ -214,6 +347,7 @@ Answer the question using ONLY the context provided.
 Guidelines:
 - Speak naturally like a human expert
 - Be clear and concise
+- Prioritize any vehicle health issues first, then explain model/manual-specific guidance
 - Do NOT repeat the question
 - Do NOT generate extra questions
 - If unsure, say you are not certain
@@ -235,28 +369,59 @@ Answer:
             return cleaned[0].upper() + cleaned[1:] if len(cleaned) > 1 else cleaned.upper()
         return (cleaned[0].upper() + cleaned[1:] if len(cleaned) > 1 else cleaned.upper()) + "."
 
-    def generate_answer(self, query: str, car_context: str = "") -> str:
-        context_chunks = self.retrieve(query, config=RetrievalConfig(k_user=2, k_global=1), car_context=car_context)
-        context = "\n".join(context_chunks) if context_chunks else "(no relevant context found)"
-        active_context = car_context.strip() if car_context.strip() else self.car_context
-        if self.user_model and self.has_user_index:
-            active_context = f"{active_context} {self.user_model}".strip()
-        if active_context:
-            context = f"(Vehicle focus: {active_context})\n\n{context}"
-        mode = self._answer_mode(query)
-        prompt = self._build_prompt(context=context, query=query, mode=mode)
+    def _tokenize_for_generation(self, prompt: str) -> tuple[dict[str, torch.Tensor], int]:
+        messages = [{"role": "user", "content": prompt}]
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            try:
+                tokenized = self.tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    return_tensors="pt",
+                    return_dict=True,
+                )
+                if isinstance(tokenized, dict) and "input_ids" in tokenized:
+                    tokenized = {k: v.to(self.device) for k, v in tokenized.items()}
+                    return tokenized, tokenized["input_ids"].shape[1]
+            except Exception:
+                pass
 
         inputs = self.tokenizer(prompt, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        input_len = inputs["input_ids"].shape[1]
+        return inputs, inputs["input_ids"].shape[1]
+
+    def generate_answer(self, query: str, car_context: str = "", priority_context: str = "") -> str:
+        quick = self._quick_smalltalk(query)
+        if quick is not None:
+            return quick
+
+        context_chunks = self.retrieve(
+            query,
+            config=RetrievalConfig(k_user=2, k_global=2),
+            car_context=car_context,
+            priority_context=priority_context,
+        )
+        context = "\n".join(context_chunks) if context_chunks else "(no relevant context found)"
+        # Keep prompt bounded for latency and to avoid max length warnings.
+        context = context[:2500]
+        active_context = car_context.strip() if car_context.strip() else self.car_context
+        if self.user_model and self.has_user_index:
+            active_context = f"{active_context} {self.user_model}".strip()
+        if priority_context.strip():
+            context = f"(Priority diagnostics)\n{priority_context.strip()[:800]}\n\n{context}"
+        if active_context:
+            context = f"(Vehicle focus: {active_context[:300]})\n\n{context}"
+        mode = self._answer_mode(query)
+        prompt = self._build_prompt(context=context, query=query, mode=mode)
+
+        inputs, input_len = self._tokenize_for_generation(prompt)
 
         with torch.no_grad():
             outputs = self.llm.generate(
                 **inputs,
-                max_new_tokens=120,
+                max_new_tokens=80,
                 do_sample=False,
                 temperature=1.0,
-                pad_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
             )
 
         full_output = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -272,7 +437,9 @@ Answer:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="RAG chat over car_docs FAISS index.")
+    parser = argparse.ArgumentParser(
+        description="RAG chat: pgvector (Postgres) or local FAISS — see RAG_KB_BACKEND."
+    )
     parser.add_argument(
         "--car",
         default="",
@@ -281,7 +448,7 @@ def main() -> None:
     parser.add_argument(
         "--user-id",
         default="user1",
-        help="Optional user id for manual-aware retrieval (expects models/<user-id>/faiss_index).",
+        help="User id for user-scoped manual chunks (Postgres rag_kb_chunks or models/<id>/).",
     )
     args = parser.parse_args()
 
@@ -293,18 +460,27 @@ def main() -> None:
     )
 
     if torch.backends.mps.is_available() and assistant.device == "cpu":
-        print("Using device: cpu (LLM; MPS off by default — set RAG_USE_MPS=1 to try Apple GPU)")
+        print("Using device: cpu (set RAG_USE_MPS=1 to try Apple GPU)")
     else:
         print(f"Using device: {assistant.device}")
+    print(f"LLM model requested: {LLM_MODEL}")
+    print(f"LLM fallback model: {FALLBACK_LLM_MODEL}")
+    print(f"LLM model loaded: {assistant.active_llm_model}")
+    if assistant._use_pgvector:
+        print("Knowledge retrieval: PostgreSQL + pgvector (rag_kb_chunks).")
+    else:
+        print("Knowledge retrieval: local FAISS + models/docs.txt.")
     if assistant.has_user_index:
         model_note = f" ({assistant.user_model})" if assistant.user_model else ""
-        print(f"Loaded user manual index: models/{args.user_id}/faiss_index{model_note}")
+        if assistant._use_pgvector:
+            print(f"User manual chunks in DB for user_id='{args.user_id}'{model_note}")
+        else:
+            print(f"Loaded user manual index: models/{args.user_id}/faiss_index{model_note}")
     else:
-        print(f"No user manual index found for '{args.user_id}', using global index only.")
+        print(f"No user manual chunks for '{args.user_id}', using global KB only.")
     if car_context:
         print(f"Car context: {car_context}")
 
-    # CLI loop
     while True:
         q = input("\nAsk about your car (type 'exit' to quit): ").strip()
         if not q:
@@ -318,4 +494,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
