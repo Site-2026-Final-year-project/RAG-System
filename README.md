@@ -136,6 +136,21 @@ python scripts/upload_manual.py --pdf path/to/manual.pdf --user-id <sub-from-jwt
 
 Express can store uploaded files and metadata; either **ETL text into `rag_kb_chunks`** and run a small embed worker, or **call/trigger** the Python scripts above after upload.
 
+## Collect web car manuals (PDF)
+
+Use this helper to discover and download owner manual PDFs from public websites into `data/raw/car_manual_pdfs/`:
+
+```bash
+python scripts/collect_car_manual_pdfs.py --source all --limit 300 --max-per-make 30
+```
+
+Useful options:
+- `--source nissan|carmans|search|all` chooses discovery sources (Carmans is multi-brand).
+- `--makes toyota,honda,ford` and `--years 2020,2021,2022` to scope the crawl.
+- `--max-per-make 30` keeps the dataset balanced across brands.
+- `--metadata-file data/raw/car_manual_pdfs/metadata.csv` stores source URLs and SHA-256 hashes.
+- Re-run the command to continue collecting; duplicates are skipped by hash.
+
 ### driver-garage-backend: index admin `MANUALS` (Education CRUD)
 
 Express stores PDFs under `uploads/education-manuals/` and saves public URLs in `EducationContent.pdf_url` (Prisma). The RAG repo can index those into `rag_kb_chunks` (same Postgres, `manual_id` = education row UUID).

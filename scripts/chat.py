@@ -7,6 +7,7 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
+import re
 
 # Repo root on sys.path (so `database` / `rag_kb` resolve when running as `python scripts/chat.py`).
 _ROOT = Path(__file__).resolve().parent.parent
@@ -39,7 +40,14 @@ INDEX_PATH = "models/faiss_index"
 DOCS_PATH = "models/docs.txt"
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-LLM_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+LLM_MODEL = os.environ.get("RAG_LLM_MODEL", "Qwen/Qwen2.5-3B-Instruct").strip()
+FALLBACK_LLM_MODEL = os.environ.get(
+    "RAG_FALLBACK_LLM_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+).strip()
+
+# Increase Hub network timeouts to reduce transient download failures.
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
 
 
 def use_pgvector_for_kb() -> bool:
@@ -109,7 +117,7 @@ def load_user_meta(user_id: str) -> str:
 
 
 def get_llm_device() -> str:
-    """Pick device for the causal LM. Apple GPU off by default — TinyLlama + MPS often segfaults."""
+    """Pick device for the causal LM."""
     if torch.cuda.is_available():
         return "cuda"
     if torch.backends.mps.is_available():
@@ -146,21 +154,38 @@ class RAGAssistant:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         self.device = get_llm_device()
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            LLM_MODEL,
-            clean_up_tokenization_spaces=False,
-        )
         if self.device == "cuda":
             torch_dtype = torch.float16
         elif self.device == "mps":
             torch_dtype = torch.float32
         else:
             torch_dtype = None
-        self.llm = AutoModelForCausalLM.from_pretrained(
-            LLM_MODEL,
-            torch_dtype=torch_dtype,
-        ).to(self.device)
-        self.llm.eval()
+
+        self.active_llm_model = ""
+        load_errors: List[str] = []
+        for candidate_model in [LLM_MODEL, FALLBACK_LLM_MODEL]:
+            if not candidate_model or candidate_model in {self.active_llm_model}:
+                continue
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    candidate_model,
+                    clean_up_tokenization_spaces=False,
+                )
+                if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
+                    self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+                self.llm = AutoModelForCausalLM.from_pretrained(
+                    candidate_model,
+                    torch_dtype=torch_dtype,
+                ).to(self.device)
+                self.llm.eval()
+                self.active_llm_model = candidate_model
+                break
+            except Exception as e:  # pragma: no cover - runtime/network dependent
+                load_errors.append(f"{candidate_model}: {e}")
+
+        if not self.active_llm_model:
+            msg = " | ".join(load_errors) if load_errors else "Unknown model loading failure"
+            raise RuntimeError(f"Failed to load any LLM model. {msg}")
 
         self.embed_model = SentenceTransformer(EMBEDDING_MODEL)
 
@@ -273,6 +298,24 @@ class RAGAssistant:
             return "simple"
         return "simple"
 
+    def _quick_smalltalk(self, query: str) -> str | None:
+        q = query.strip().lower()
+        q_alpha = re.sub(r"[^a-z\s]", "", q)
+        greetings = {"hi", "hello", "hey", "yo", "hii", "helo"}
+        thanks = {"thanks", "thank you", "thx", "ty"}
+        bye = {"bye", "goodbye", "see you"}
+
+        if q in greetings or q_alpha in greetings:
+            return (
+                "Hi! I can help with your vehicle health, symptoms, and manual-based guidance. "
+                "Tell me what issue you are seeing."
+            )
+        if q in thanks or q_alpha in thanks:
+            return "You are welcome. If you want, share your car issue and I will help step by step."
+        if q in bye or q_alpha in bye:
+            return "Goodbye. Drive safe!"
+        return None
+
     def _build_prompt(self, context: str, query: str, mode: str) -> str:
         if mode == "technical":
             return f"""
@@ -326,7 +369,31 @@ Answer:
             return cleaned[0].upper() + cleaned[1:] if len(cleaned) > 1 else cleaned.upper()
         return (cleaned[0].upper() + cleaned[1:] if len(cleaned) > 1 else cleaned.upper()) + "."
 
+    def _tokenize_for_generation(self, prompt: str) -> tuple[dict[str, torch.Tensor], int]:
+        messages = [{"role": "user", "content": prompt}]
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            try:
+                tokenized = self.tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    return_tensors="pt",
+                    return_dict=True,
+                )
+                if isinstance(tokenized, dict) and "input_ids" in tokenized:
+                    tokenized = {k: v.to(self.device) for k, v in tokenized.items()}
+                    return tokenized, tokenized["input_ids"].shape[1]
+            except Exception:
+                pass
+
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        return inputs, inputs["input_ids"].shape[1]
+
     def generate_answer(self, query: str, car_context: str = "", priority_context: str = "") -> str:
+        quick = self._quick_smalltalk(query)
+        if quick is not None:
+            return quick
+
         context_chunks = self.retrieve(
             query,
             config=RetrievalConfig(k_user=2, k_global=2),
@@ -334,27 +401,27 @@ Answer:
             priority_context=priority_context,
         )
         context = "\n".join(context_chunks) if context_chunks else "(no relevant context found)"
+        # Keep prompt bounded for latency and to avoid max length warnings.
+        context = context[:2500]
         active_context = car_context.strip() if car_context.strip() else self.car_context
         if self.user_model and self.has_user_index:
             active_context = f"{active_context} {self.user_model}".strip()
         if priority_context.strip():
-            context = f"(Priority diagnostics)\n{priority_context.strip()}\n\n{context}"
+            context = f"(Priority diagnostics)\n{priority_context.strip()[:800]}\n\n{context}"
         if active_context:
-            context = f"(Vehicle focus: {active_context})\n\n{context}"
+            context = f"(Vehicle focus: {active_context[:300]})\n\n{context}"
         mode = self._answer_mode(query)
         prompt = self._build_prompt(context=context, query=query, mode=mode)
 
-        inputs = self.tokenizer(prompt, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        input_len = inputs["input_ids"].shape[1]
+        inputs, input_len = self._tokenize_for_generation(prompt)
 
         with torch.no_grad():
             outputs = self.llm.generate(
                 **inputs,
-                max_new_tokens=120,
+                max_new_tokens=80,
                 do_sample=False,
                 temperature=1.0,
-                pad_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
             )
 
         full_output = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -393,9 +460,12 @@ def main() -> None:
     )
 
     if torch.backends.mps.is_available() and assistant.device == "cpu":
-        print("Using device: cpu (LLM; MPS off by default — set RAG_USE_MPS=1 to try Apple GPU)")
+        print("Using device: cpu (set RAG_USE_MPS=1 to try Apple GPU)")
     else:
         print(f"Using device: {assistant.device}")
+    print(f"LLM model requested: {LLM_MODEL}")
+    print(f"LLM fallback model: {FALLBACK_LLM_MODEL}")
+    print(f"LLM model loaded: {assistant.active_llm_model}")
     if assistant._use_pgvector:
         print("Knowledge retrieval: PostgreSQL + pgvector (rag_kb_chunks).")
     else:

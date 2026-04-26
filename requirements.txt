@@ -7,6 +7,7 @@ transformers==4.45.0
 tokenizers==0.20.3
 sentence-transformers==3.0.1
 huggingface-hub==0.31.4
+hf_xet==1.4.3
 # faiss-cpu==1.8.0.post1 does not publish Python 3.13 wheels; use a newer build.
 faiss-cpu==1.13.2
 fastapi==0.116.1
