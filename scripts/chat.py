@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import warnings
@@ -26,6 +27,7 @@ torch.set_num_threads(1)
 
 import faiss
 import numpy as np
+from gradio_client import Client
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -49,6 +51,10 @@ FALLBACK_LLM_MODEL = os.environ.get(
 
 REMOTE_LLM_URL = os.environ.get("RAG_REMOTE_LLM_URL", "").strip()
 REMOTE_LLM_SECRET = os.environ.get("RAG_REMOTE_LLM_SECRET", "").strip()
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "").strip().lower()
+HF_SPACE_ID = os.environ.get("HF_SPACE_ID", "").strip()
+HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "").strip()
+HF_SPACE_API_NAME = os.environ.get("HF_SPACE_API_NAME", "/predict").strip() or "/predict"
 
 # Increase Hub network timeouts to reduce transient download failures.
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
@@ -159,9 +165,19 @@ class RAGAssistant:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         self.remote_llm_url = REMOTE_LLM_URL
         self.remote_llm_secret = REMOTE_LLM_SECRET
+        self.llm_provider = LLM_PROVIDER
+        self.hf_space_id = HF_SPACE_ID
+        self.hf_space_url = HF_SPACE_URL
+        self.hf_space_api_name = HF_SPACE_API_NAME
+        self._hf_client: Client | None = None
         self.device = get_llm_device()
 
-        if self.remote_llm_url:
+        if self.llm_provider == "hf_space":
+            target = self.hf_space_id or self.hf_space_url or "(missing HF_SPACE_ID/HF_SPACE_URL)"
+            self.active_llm_model = f"hf_space:{target}"
+            self.llm = None
+            self.tokenizer = None
+        elif self.remote_llm_url:
             # Defer generation to a remote service (e.g. Colab). This avoids loading local
             # transformer weights on constrained hosts (Render free/CPU instances).
             self.active_llm_model = f"remote:{self.remote_llm_url}"
@@ -384,8 +400,8 @@ Answer:
         return (cleaned[0].upper() + cleaned[1:] if len(cleaned) > 1 else cleaned.upper()) + "."
 
     def _tokenize_for_generation(self, prompt: str) -> tuple[dict[str, torch.Tensor], int]:
-        if self.remote_llm_url:
-            raise RuntimeError("Tokenization is not used when RAG_REMOTE_LLM_URL is set.")
+        if self.remote_llm_url or self.llm_provider == "hf_space":
+            raise RuntimeError("Tokenization is not used when a remote LLM provider is configured.")
         messages = [{"role": "user", "content": prompt}]
         if hasattr(self.tokenizer, "apply_chat_template"):
             try:
@@ -426,6 +442,31 @@ Answer:
         answer = (data.get("answer") or "").strip()
         return answer
 
+    def _hf_space_generate(self, prompt: str) -> str:
+        target = self.hf_space_id or self.hf_space_url
+        if not target:
+            raise RuntimeError("LLM_PROVIDER=hf_space requires HF_SPACE_ID or HF_SPACE_URL.")
+        if self._hf_client is None:
+            self._hf_client = Client(target)
+        try:
+            result = self._hf_client.predict(prompt=prompt, api_name=self.hf_space_api_name)
+        except Exception as e:  # pragma: no cover - network/runtime dependent
+            raise RuntimeError(f"HF Space generation failed: {e}") from e
+
+        if isinstance(result, str):
+            text = result.strip()
+            if text.startswith("{") and text.endswith("}"):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        return str(parsed.get("answer") or text).strip()
+                except json.JSONDecodeError:
+                    pass
+            return text
+        if isinstance(result, dict):
+            return str(result.get("answer") or "").strip()
+        return str(result).strip()
+
     def generate_answer(self, query: str, car_context: str = "", priority_context: str = "") -> str:
         quick = self._quick_smalltalk(query)
         if quick is not None:
@@ -450,7 +491,9 @@ Answer:
         mode = self._answer_mode(query)
         prompt = self._build_prompt(context=context, query=query, mode=mode)
 
-        if self.remote_llm_url:
+        if self.llm_provider == "hf_space":
+            answer = self._hf_space_generate(prompt)
+        elif self.remote_llm_url:
             answer = self._remote_generate(prompt)
         else:
             assert self.llm is not None
