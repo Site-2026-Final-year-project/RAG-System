@@ -48,6 +48,7 @@ torch.set_num_threads(1)
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 CHUNK_WORDS_DEFAULT = 200
+DEFAULT_EXPRESS_BASE_URL = ""
 
 
 def chunk_text(text: str, size: int) -> list[str]:
@@ -73,6 +74,28 @@ def resolve_local_pdf_path(pdf_url: str, express_root: Path) -> Path | None:
         return None
     candidate = express_root / rel
     return candidate if candidate.is_file() else None
+
+
+def normalize_pdf_url_for_remote(pdf_url: str, express_base_url: str) -> str:
+    """
+    Rewrite localhost upload URLs to the deployed backend origin.
+
+    Keeps already-public URLs unchanged.
+    """
+    url = (pdf_url or "").strip()
+    if not url:
+        return url
+    if not (express_base_url or "").strip():
+        return url
+
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host not in {"localhost", "127.0.0.1", "::1"}:
+        return url
+
+    base = express_base_url.rstrip("/")
+    path = parsed.path if parsed.path.startswith("/") else f"/{parsed.path}"
+    return f"{base}{path}"
 
 
 def load_pdf_bytes(pdf_url: str, express_root: Path | None) -> bytes:
@@ -135,9 +158,11 @@ def sync_one(
     pdf_url: str,
     *,
     express_root: Path | None,
+    express_base_url: str,
     chunk_words: int,
     embed_model: SentenceTransformer,
 ) -> int:
+    pdf_url = normalize_pdf_url_for_remote(pdf_url, express_base_url)
     data = load_pdf_bytes(pdf_url, express_root)
     text_body = extract_text_from_pdf_bytes(data)
     if not text_body:
@@ -183,6 +208,13 @@ def main() -> None:
         "Default: EXPRESS_PROJECT_ROOT env.",
     )
     parser.add_argument("--content-id", type=str, default=None, help="Sync only this EducationContent id.")
+    parser.add_argument(
+        "--express-base-url",
+        type=str,
+        default=(os.environ.get("EXPRESS_BASE_URL") or DEFAULT_EXPRESS_BASE_URL).strip(),
+        help="Public Express backend base URL used to replace localhost URLs from DB "
+        "(default: EXPRESS_BASE_URL env or Render endpoint).",
+    )
     parser.add_argument("--chunk-words", type=int, default=CHUNK_WORDS_DEFAULT)
     args = parser.parse_args()
 
@@ -210,6 +242,7 @@ def main() -> None:
                     title,
                     pdf_url,
                     express_root=express_root,
+                    express_base_url=args.express_base_url,
                     chunk_words=args.chunk_words,
                     embed_model=embed_model,
                 )

@@ -75,10 +75,10 @@ def get_current_user_id(
             payload = jwt.decode(credentials.credentials, JWT_SECRET, **decode_kwargs)
         except jwt.PyJWTError as e:
             raise HTTPException(status_code=401, detail=f"Invalid token: {e}") from e
-        sub = payload.get("sub")
-        if not sub or not str(sub).strip():
-            raise HTTPException(status_code=401, detail="Token missing 'sub' claim.")
-        return str(sub).strip()
+        user_id = payload.get("sub") or payload.get("id")
+        if not user_id or not str(user_id).strip():
+            raise HTTPException(status_code=401, detail="Token missing 'sub' (or 'id') claim.")
+        return str(user_id).strip()
 
     if x_user_id and x_user_id.strip():
         return x_user_id.strip()

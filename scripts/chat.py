@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import List
 import re
 
+import requests
+
 # Repo root on sys.path (so `database` / `rag_kb` resolve when running as `python scripts/chat.py`).
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
@@ -44,6 +46,9 @@ LLM_MODEL = os.environ.get("RAG_LLM_MODEL", "Qwen/Qwen2.5-3B-Instruct").strip()
 FALLBACK_LLM_MODEL = os.environ.get(
     "RAG_FALLBACK_LLM_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 ).strip()
+
+REMOTE_LLM_URL = os.environ.get("RAG_REMOTE_LLM_URL", "").strip()
+REMOTE_LLM_SECRET = os.environ.get("RAG_REMOTE_LLM_SECRET", "").strip()
 
 # Increase Hub network timeouts to reduce transient download failures.
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
@@ -152,40 +157,49 @@ class RAGAssistant:
             self.user_model = ""
 
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        self.remote_llm_url = REMOTE_LLM_URL
+        self.remote_llm_secret = REMOTE_LLM_SECRET
         self.device = get_llm_device()
 
-        if self.device == "cuda":
-            torch_dtype = torch.float16
-        elif self.device == "mps":
-            torch_dtype = torch.float32
+        if self.remote_llm_url:
+            # Defer generation to a remote service (e.g. Colab). This avoids loading local
+            # transformer weights on constrained hosts (Render free/CPU instances).
+            self.active_llm_model = f"remote:{self.remote_llm_url}"
+            self.llm = None
+            self.tokenizer = None
         else:
-            torch_dtype = None
+            if self.device == "cuda":
+                torch_dtype = torch.float16
+            elif self.device == "mps":
+                torch_dtype = torch.float32
+            else:
+                torch_dtype = None
 
-        self.active_llm_model = ""
-        load_errors: List[str] = []
-        for candidate_model in [LLM_MODEL, FALLBACK_LLM_MODEL]:
-            if not candidate_model or candidate_model in {self.active_llm_model}:
-                continue
-            try:
-                self.tokenizer = AutoTokenizer.from_pretrained(
-                    candidate_model,
-                    clean_up_tokenization_spaces=False,
-                )
-                if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
-                    self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-                self.llm = AutoModelForCausalLM.from_pretrained(
-                    candidate_model,
-                    torch_dtype=torch_dtype,
-                ).to(self.device)
-                self.llm.eval()
-                self.active_llm_model = candidate_model
-                break
-            except Exception as e:  # pragma: no cover - runtime/network dependent
-                load_errors.append(f"{candidate_model}: {e}")
+            self.active_llm_model = ""
+            load_errors: List[str] = []
+            for candidate_model in [LLM_MODEL, FALLBACK_LLM_MODEL]:
+                if not candidate_model or candidate_model in {self.active_llm_model}:
+                    continue
+                try:
+                    self.tokenizer = AutoTokenizer.from_pretrained(
+                        candidate_model,
+                        clean_up_tokenization_spaces=False,
+                    )
+                    if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
+                        self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+                    self.llm = AutoModelForCausalLM.from_pretrained(
+                        candidate_model,
+                        torch_dtype=torch_dtype,
+                    ).to(self.device)
+                    self.llm.eval()
+                    self.active_llm_model = candidate_model
+                    break
+                except Exception as e:  # pragma: no cover - runtime/network dependent
+                    load_errors.append(f"{candidate_model}: {e}")
 
-        if not self.active_llm_model:
-            msg = " | ".join(load_errors) if load_errors else "Unknown model loading failure"
-            raise RuntimeError(f"Failed to load any LLM model. {msg}")
+            if not self.active_llm_model:
+                msg = " | ".join(load_errors) if load_errors else "Unknown model loading failure"
+                raise RuntimeError(f"Failed to load any LLM model. {msg}")
 
         self.embed_model = SentenceTransformer(EMBEDDING_MODEL)
 
@@ -370,6 +384,8 @@ Answer:
         return (cleaned[0].upper() + cleaned[1:] if len(cleaned) > 1 else cleaned.upper()) + "."
 
     def _tokenize_for_generation(self, prompt: str) -> tuple[dict[str, torch.Tensor], int]:
+        if self.remote_llm_url:
+            raise RuntimeError("Tokenization is not used when RAG_REMOTE_LLM_URL is set.")
         messages = [{"role": "user", "content": prompt}]
         if hasattr(self.tokenizer, "apply_chat_template"):
             try:
@@ -388,6 +404,27 @@ Answer:
         inputs = self.tokenizer(prompt, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         return inputs, inputs["input_ids"].shape[1]
+
+    def _remote_generate(self, prompt: str) -> str:
+        if not self.remote_llm_url:
+            raise RuntimeError("Remote LLM URL not configured.")
+        headers = {"Content-Type": "application/json"}
+        if self.remote_llm_secret:
+            headers["X-LLM-Secret"] = self.remote_llm_secret
+        payload = {
+            "prompt": prompt,
+            "max_new_tokens": 120,
+        }
+        try:
+            resp = requests.post(self.remote_llm_url, json=payload, headers=headers, timeout=90)
+        except requests.RequestException as e:
+            raise RuntimeError(f"Remote LLM request failed: {e}") from e
+        if resp.status_code != 200:
+            body = resp.text[:500]
+            raise RuntimeError(f"Remote LLM error {resp.status_code}: {body}")
+        data = resp.json()
+        answer = (data.get("answer") or "").strip()
+        return answer
 
     def generate_answer(self, query: str, car_context: str = "", priority_context: str = "") -> str:
         quick = self._quick_smalltalk(query)
@@ -413,24 +450,29 @@ Answer:
         mode = self._answer_mode(query)
         prompt = self._build_prompt(context=context, query=query, mode=mode)
 
-        inputs, input_len = self._tokenize_for_generation(prompt)
-
-        with torch.no_grad():
-            outputs = self.llm.generate(
-                **inputs,
-                max_new_tokens=80,
-                do_sample=False,
-                temperature=1.0,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
-
-        full_output = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        if "Answer:" in full_output:
-            answer = full_output.split("Answer:")[-1].strip()
-        elif "Final Answer:" in full_output:
-            answer = full_output.split("Final Answer:")[-1].strip()
+        if self.remote_llm_url:
+            answer = self._remote_generate(prompt)
         else:
-            answer = self.tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+            assert self.llm is not None
+            assert self.tokenizer is not None
+            inputs, input_len = self._tokenize_for_generation(prompt)
+
+            with torch.no_grad():
+                outputs = self.llm.generate(
+                    **inputs,
+                    max_new_tokens=80,
+                    do_sample=False,
+                    temperature=1.0,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+
+            full_output = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            if "Answer:" in full_output:
+                answer = full_output.split("Answer:")[-1].strip()
+            elif "Final Answer:" in full_output:
+                answer = full_output.split("Final Answer:")[-1].strip()
+            else:
+                answer = self.tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
 
         answer = answer.split("Question:")[0].split("Context:")[0].strip()
         return self._format_answer(answer)
