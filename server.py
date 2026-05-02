@@ -153,6 +153,7 @@ class ChatSessionResponse(BaseModel):
     user_id: str
     title: str
     car_context: str
+    vehicle_id: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -199,6 +200,7 @@ def to_session_response(session: ChatSessionModel) -> ChatSessionResponse:
         user_id=session.user_id,
         title=session.title,
         car_context=session.car_context,
+        vehicle_id=getattr(session, "vehicle_id", None),
         created_at=session.created_at,
         updated_at=session.updated_at,
     )
@@ -250,13 +252,15 @@ def normalize_vehicle_context(payload: Any) -> tuple[str, str]:
 
     priority_lines: List[str] = []
     if health is not None:
-        priority_lines.append(f"Vehicle health overall: {health.overallPercent}%")
+        priority_lines.append(f"Overall maintenance health: {health.overallPercent}%")
         if health.summary:
-            priority_lines.append(f"Health summary: {health.summary.strip()}")
+            priority_lines.append(f"Summary: {health.summary.strip()}")
+        for c in sorted(health.components, key=lambda x: (x.label or "").lower()):
+            priority_lines.append(f"{c.label}: {c.percent}%")
         concerning = [c for c in health.components if c.percent <= 60]
         if concerning:
-            issues = ", ".join(f"{c.label} {c.percent}%" for c in concerning)
-            priority_lines.append(f"Priority issues: {issues}")
+            issues = ", ".join(f"{c.label} at {c.percent}%" for c in concerning)
+            priority_lines.append(f"Needs attention: {issues}")
 
     if manual_context:
         parts.append(f"Driver context: {manual_context}")
@@ -376,8 +380,10 @@ def fetch_vehicle_context_from_db(vehicle_id: str, user_id: str) -> tuple[Vehicl
         return vehicle, health
 
 
-def resolve_context_hybrid(payload: Any, user_id: str) -> tuple[str, str]:
-    vehicle_id = _extract_vehicle_id(payload)
+def resolve_context_hybrid(
+    payload: Any, user_id: str, *, fallback_vehicle_id: str | None = None
+) -> tuple[str, str]:
+    vehicle_id = (_extract_vehicle_id(payload) or "").strip() or (fallback_vehicle_id or "").strip()
     vehicle_db, health_db = fetch_vehicle_context_from_db(vehicle_id, user_id)
 
     vehicle_context = getattr(payload, "vehicle_context", None)
@@ -433,13 +439,15 @@ def create_session(
     payload: CreateSessionRequest,
     user_id: Annotated[str, Depends(get_current_user_id)],
 ) -> ChatSessionResponse:
-    short_ctx, _ = resolve_context_hybrid(payload, user_id)
+    vid = (_extract_vehicle_id(payload) or "").strip() or None
+    short_ctx, _ = resolve_context_hybrid(payload, user_id, fallback_vehicle_id=vid)
     now = utcnow()
     session = ChatSessionModel(
         id=str(uuid.uuid4()),
         user_id=user_id,
         title=((payload.title or "").strip() or "New chat"),
         car_context=short_ctx,
+        vehicle_id=vid,
         created_at=now,
         updated_at=now,
     )
@@ -537,6 +545,8 @@ def send_message(
     if not text:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
+    payload_vehicle_id = (_extract_vehicle_id(payload) or "").strip()
+
     with SessionLocal() as db:
         session = db.get(ChatSessionModel, session_id)
         if session is None or session.user_id != user_id:
@@ -553,7 +563,10 @@ def send_message(
         db.commit()
         db.refresh(user_message)
 
-    short_ctx, detailed_ctx = resolve_context_hybrid(payload, user_id)
+    merged_vid = payload_vehicle_id or (session.vehicle_id or "").strip()
+    short_ctx, detailed_ctx = resolve_context_hybrid(
+        payload, user_id, fallback_vehicle_id=merged_vid or None
+    )
     active_context = short_ctx or session.car_context
     if payload.title and payload.title.strip():
         session_title = payload.title.strip()
@@ -586,6 +599,10 @@ def send_message(
             session_to_update.updated_at = utcnow()
             if active_context:
                 session_to_update.car_context = _shorten_context(active_context)
+            if payload_vehicle_id:
+                session_to_update.vehicle_id = payload_vehicle_id
+            elif merged_vid and not (session_to_update.vehicle_id or "").strip():
+                session_to_update.vehicle_id = merged_vid
             if session_title:
                 session_to_update.title = session_title
 

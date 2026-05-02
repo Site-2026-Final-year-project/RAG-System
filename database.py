@@ -38,6 +38,8 @@ class ChatSessionModel(Base):
     user_id: Mapped[str] = mapped_column(String(128), index=True)
     title: Mapped[str] = mapped_column(String(255), default="New chat")
     car_context: Mapped[str] = mapped_column(String(255), default="")
+    # Links chat to Prisma Vehicle.id so every message can load maintenance health without client resending it.
+    vehicle_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 

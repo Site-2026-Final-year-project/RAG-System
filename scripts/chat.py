@@ -44,6 +44,29 @@ INDEX_PATH = "models/faiss_index"
 DOCS_PATH = "models/docs.txt"
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+
+# One shared model/client for all RAGAssistant instances — critical on low-RAM hosts (e.g. Render Free),
+# where caching assistants per user/context would load SentenceTransformer repeatedly and OOM → 502.
+_shared_sentence_transformer: SentenceTransformer | None = None
+_hf_space_client_lock_target: str | None = None
+_hf_space_client_singleton: Client | None = None
+
+
+def _get_shared_sentence_transformer() -> SentenceTransformer:
+    global _shared_sentence_transformer
+    if _shared_sentence_transformer is None:
+        _shared_sentence_transformer = SentenceTransformer(EMBEDDING_MODEL)
+    return _shared_sentence_transformer
+
+
+def _get_hf_space_client(target: str) -> Client:
+    global _hf_space_client_lock_target, _hf_space_client_singleton
+    if _hf_space_client_singleton is None or _hf_space_client_lock_target != target:
+        _hf_space_client_lock_target = target
+        _hf_space_client_singleton = Client(target)
+    return _hf_space_client_singleton
+
+
 LLM_MODEL = os.environ.get("RAG_LLM_MODEL", "Qwen/Qwen2.5-3B-Instruct").strip()
 FALLBACK_LLM_MODEL = os.environ.get(
     "RAG_FALLBACK_LLM_MODEL", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
@@ -141,7 +164,7 @@ def get_llm_device() -> str:
 @dataclass
 class RetrievalConfig:
     k_user: int = 2
-    k_global: int = 1
+    k_global: int = 3
 
 
 class RAGAssistant:
@@ -169,7 +192,6 @@ class RAGAssistant:
         self.hf_space_id = HF_SPACE_ID
         self.hf_space_url = HF_SPACE_URL
         self.hf_space_api_name = HF_SPACE_API_NAME
-        self._hf_client: Client | None = None
         self.device = get_llm_device()
 
         if self.llm_provider == "hf_space":
@@ -217,7 +239,7 @@ class RAGAssistant:
                 msg = " | ".join(load_errors) if load_errors else "Unknown model loading failure"
                 raise RuntimeError(f"Failed to load any LLM model. {msg}")
 
-        self.embed_model = SentenceTransformer(EMBEDDING_MODEL)
+        self.embed_model = _get_shared_sentence_transformer()
 
         if self._use_pgvector:
             self.global_index = None
@@ -346,19 +368,71 @@ class RAGAssistant:
             return "Goodbye. Drive safe!"
         return None
 
+    def _wants_vehicle_status(self, query: str) -> bool:
+        q = " ".join(re.sub(r"[^\w\s]", " ", query.lower()).split())
+        phrases = (
+            "tell me about my car",
+            "about my car",
+            "my car status",
+            "car status",
+            "vehicle status",
+            "how is my car",
+            "health of my car",
+            "overall health",
+            "maintenance status",
+            "condition of my car",
+            "how my car is doing",
+            "status of my car",
+            "vehicle health",
+        )
+        return any(p in q for p in phrases)
+
+    def _vehicle_status_missing_snapshot_message(self, vehicle_focus: str) -> str:
+        label = vehicle_focus.strip() or "this vehicle"
+        return (
+            f"I don’t have a maintenance-health snapshot linked for **{label}** in this chat session.\n\n"
+            "Make sure you **start the assistant from your vehicle screen** (or send **vehicle_id**) so the "
+            "server can load **Vehicle** + **VehicleMaintenanceHealth** from the database.\n\n"
+            "After that, ask again for status—I will report overall health and each component percentage."
+        )
+
+    def _vehicle_status_reply_from_priority(self, priority_context: str, vehicle_focus: str) -> str:
+        lines_raw = [ln.strip() for ln in priority_context.splitlines() if ln.strip()]
+        label = vehicle_focus.strip() or "your vehicle"
+        for ln in lines_raw:
+            if ln.lower().startswith("vehicle:"):
+                label = ln.split(":", 1)[1].strip()
+                break
+        out: List[str] = [
+            f"**Vehicle status — {label}**",
+            "",
+            "Summary from your **saved garage profile** (latest maintenance-health snapshot). "
+            "This reflects calculated maintenance scores, not live OBD readings.",
+            "",
+        ]
+        for ln in lines_raw:
+            out.append(f"• {ln}")
+        out.extend(
+            [
+                "",
+                "**Disclaimer:** Values are planning aids only. For safety-critical faults or warning lamps, "
+                "follow your owner manual and consult a qualified technician.",
+            ]
+        )
+        return "\n".join(out)
+
     def _build_prompt(self, context: str, query: str, mode: str) -> str:
         if mode == "technical":
             return f"""
-You are an expert automotive assistant.
+You are an expert automotive assistant for a production driver app.
 
-Provide a precise and technical answer based on the context.
+Provide a precise answer from the context. If a garage profile snapshot lists maintenance-health percentages,
+report them accurately before citing manual excerpts.
 
 Guidelines:
-- Use correct automotive terminology
-- Be concise but informative
-- Do NOT repeat the question
-- Do NOT generate extra questions
-- If unsure, say you are not certain
+- Use correct automotive terminology; stay factual.
+- Do NOT repeat the question; do NOT invent DTCs or measurements.
+- If unsure, say what is missing.
 
 Context:
 {context}
@@ -370,17 +444,19 @@ Answer:
 """.strip()
 
         return f"""
-You are a friendly and knowledgeable car assistant helping drivers understand their vehicles.
+You are a professional automotive advisor for a driver-assistance product.
 
-Answer the question using ONLY the context provided.
+Answer using the context below. When the context includes a **Garage profile snapshot**, treat numeric health
+percentages and vehicle facts from that section as authoritative for “how is my car” style questions.
 
 Guidelines:
-- Speak naturally like a human expert
-- Be clear and concise
-- Prioritize any vehicle health issues first, then explain model/manual-specific guidance
-- Do NOT repeat the question
-- Do NOT generate extra questions
-- If unsure, say you are not certain
+- Sound calm, precise, and professional (service-advisor tone).
+- Lead with concrete facts (percentages, mileage, plate if present), then brief interpretation.
+- Use manual excerpts only as supporting detail for procedures or warnings.
+- If manual excerpts are missing, still answer from the garage snapshot when present.
+- Do NOT repeat the user question verbatim.
+- Do NOT invent sensors, DTC codes, or measurements not in the context.
+- If information is insufficient, say what is missing in one sentence.
 
 Context:
 {context}
@@ -392,12 +468,24 @@ Answer:
 """.strip()
 
     def _format_answer(self, text: str) -> str:
-        cleaned = " ".join(text.strip().split())
+        raw = text.strip()
+        if not raw:
+            return "I am not certain based on the retrieved context."
+        lines = [" ".join(line.split()) for line in raw.splitlines()]
+        cleaned = "\n".join(lines).strip()
         if not cleaned:
             return "I am not certain based on the retrieved context."
-        if cleaned.endswith(("?", "!", ".")):
-            return cleaned[0].upper() + cleaned[1:] if len(cleaned) > 1 else cleaned.upper()
-        return (cleaned[0].upper() + cleaned[1:] if len(cleaned) > 1 else cleaned.upper()) + "."
+        capitalized = False
+        formatted_lines: List[str] = []
+        for line in lines:
+            if line.strip() and not capitalized and line[0].isalpha():
+                line = line[0].upper() + line[1:]
+                capitalized = True
+            formatted_lines.append(line)
+        out = "\n".join(formatted_lines).strip()
+        if "\n" not in out and not out.endswith(("?", "!", ".")):
+            out += "."
+        return out
 
     def _tokenize_for_generation(self, prompt: str) -> tuple[dict[str, torch.Tensor], int]:
         if self.remote_llm_url or self.llm_provider == "hf_space":
@@ -446,10 +534,9 @@ Answer:
         target = self.hf_space_id or self.hf_space_url
         if not target:
             raise RuntimeError("LLM_PROVIDER=hf_space requires HF_SPACE_ID or HF_SPACE_URL.")
-        if self._hf_client is None:
-            self._hf_client = Client(target)
+        client = _get_hf_space_client(target)
         try:
-            result = self._hf_client.predict(prompt=prompt, api_name=self.hf_space_api_name)
+            result = client.predict(prompt=prompt, api_name=self.hf_space_api_name)
         except Exception as e:  # pragma: no cover - network/runtime dependent
             raise RuntimeError(f"HF Space generation failed: {e}") from e
 
@@ -472,20 +559,47 @@ Answer:
         if quick is not None:
             return quick
 
-        context_chunks = self.retrieve(
-            query,
-            config=RetrievalConfig(k_user=2, k_global=2),
-            car_context=car_context,
-            priority_context=priority_context,
-        )
-        context = "\n".join(context_chunks) if context_chunks else "(no relevant context found)"
-        # Keep prompt bounded for latency and to avoid max length warnings.
-        context = context[:2500]
         active_context = car_context.strip() if car_context.strip() else self.car_context
         if self.user_model and self.has_user_index:
             active_context = f"{active_context} {self.user_model}".strip()
-        if priority_context.strip():
-            context = f"(Priority diagnostics)\n{priority_context.strip()[:800]}\n\n{context}"
+
+        snap = priority_context.strip()
+        wants_status = self._wants_vehicle_status(query)
+
+        if wants_status:
+            if snap:
+                context_chunks = self.retrieve(
+                    query,
+                    config=RetrievalConfig(k_user=2, k_global=3),
+                    car_context=car_context,
+                    priority_context=priority_context,
+                )
+                reply = self._vehicle_status_reply_from_priority(snap, active_context)
+                if context_chunks:
+                    reply += "\n\n—\n**Owner manual excerpts**\n"
+                    for i, ch in enumerate(context_chunks[:3], 1):
+                        excerpt = " ".join(ch.split())[:480]
+                        reply += f"\n{i}. {excerpt}"
+                return self._format_answer(reply)
+            return self._format_answer(self._vehicle_status_missing_snapshot_message(active_context))
+
+        context_chunks = self.retrieve(
+            query,
+            config=RetrievalConfig(k_user=2, k_global=3),
+            car_context=car_context,
+            priority_context=priority_context,
+        )
+        manual_block = (
+            "No matching owner-manual excerpts were retrieved."
+            if not context_chunks
+            else "\n".join(context_chunks)
+        )
+        context = manual_block[:2500]
+        if snap:
+            context = (
+                f"(Garage profile snapshot — factual vehicle state)\n{snap[:2400]}\n\n"
+                f"(Owner manual excerpts)\n{context}"
+            )
         if active_context:
             context = f"(Vehicle focus: {active_context[:300]})\n\n{context}"
         mode = self._answer_mode(query)
@@ -499,11 +613,12 @@ Answer:
             assert self.llm is not None
             assert self.tokenizer is not None
             inputs, input_len = self._tokenize_for_generation(prompt)
+            max_tokens = 140 if snap else 96
 
             with torch.no_grad():
                 outputs = self.llm.generate(
                     **inputs,
-                    max_new_tokens=80,
+                    max_new_tokens=max_tokens,
                     do_sample=False,
                     temperature=1.0,
                     pad_token_id=self.tokenizer.pad_token_id,
@@ -518,6 +633,14 @@ Answer:
                 answer = self.tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
 
         answer = answer.split("Question:")[0].split("Context:")[0].strip()
+        answer_lower = answer.lower()
+        if (not answer or "no relevant context" in answer_lower) and snap:
+            blended = self._vehicle_status_reply_from_priority(snap, active_context)
+            if context_chunks:
+                blended += "\n\n—\n**Owner manual excerpts**\n"
+                for i, ch in enumerate(context_chunks[:2], 1):
+                    blended += f"\n{i}. {' '.join(ch.split())[:400]}"
+            return self._format_answer(blended)
         return self._format_answer(answer)
 
 
