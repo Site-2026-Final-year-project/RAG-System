@@ -121,7 +121,10 @@ Retrieval no longer requires local FAISS files when `DATABASE_URL` points at **P
   - `RAG_KB_BACKEND=pgvector`: require Postgres + tables (fails fast if URL is not Postgres).
 
 - **Schema** (reference SQL): `docs/schema_rag_pgvector.sql`  
-  SQLAlchemy also creates compatible tables on startup when using Postgres.
+  Docker loads the same tables + **HNSW index** from `docker/initdb/02-rag_kb.sql` on first database init.
+- **Existing Postgres** (already full of chunks): create the vector index once —  
+  `export DATABASE_URL=... && python scripts/apply_vector_index.py`  
+  (or run `docs/migrations/002_rag_kb_chunks_embedding_hnsw.sql` with `CONCURRENTLY` during production maintenance).
 
 - **Sync global KB from this repo** (embeds + upserts global rows):
 
