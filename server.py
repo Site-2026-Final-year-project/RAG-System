@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, desc, or_, select, text
+from sqlalchemy.exc import SQLAlchemyError
 
 from database import ChatMessageModel, ChatSessionModel, SessionLocal, session_for_prisma_reads
 from scripts.chat import RAGAssistant
@@ -336,48 +337,56 @@ def fetch_vehicle_context_from_db(vehicle_id: str, user_id: str) -> tuple[Vehicl
     LIMIT 1
     """
 
-    with SessionLocal() as db:
-        row = db.execute(text(vehicle_sql_owner), {"vehicle_id": vehicle_id, "user_id": user_id}).mappings().first()
-        if row is None:
-            # Dev fallback: allow vehicle lookup by id when X-User-Id does not match Driver.id yet.
-            row = db.execute(text(vehicle_sql_by_id), {"vehicle_id": vehicle_id}).mappings().first()
-        if row is None:
-            return None, None
+    try:
+        with SessionLocal() as db:
+            row = db.execute(
+                text(vehicle_sql_owner), {"vehicle_id": vehicle_id, "user_id": user_id}
+            ).mappings().first()
+            if row is None:
+                # Dev fallback: allow vehicle lookup by id when X-User-Id does not match Driver.id yet.
+                row = db.execute(text(vehicle_sql_by_id), {"vehicle_id": vehicle_id}).mappings().first()
+            if row is None:
+                return None, None
 
-        vehicle = VehiclePayload(
-            id=str(row["id"]),
-            driverId=str(row["driverId"]) if row.get("driverId") is not None else None,
-            plateNumber=row.get("plateNumber"),
-            make=row.get("make"),
-            model=row.get("model"),
-            year=row.get("year"),
-            displayName=" ".join(
-                p
-                for p in [
-                    str(row.get("year")) if row.get("year") else "",
-                    row.get("make") or "",
-                    row.get("model") or "",
-                ]
-                if p
-            ).strip()
-            or None,
-            type=row.get("type"),
-            color=row.get("color"),
-            vin=row.get("vin"),
-            mileage=row.get("mileage"),
-            fuelType=row.get("fuel_type"),
-            imageUrl=row.get("image_url"),
-            insuranceDocumentUrl=row.get("insurance_document_url"),
-            insuranceExpiresAt=row.get("insurance_expires_at"),
-            registrationDocumentUrl=row.get("registration_document_url"),
-            registrationExpiresAt=row.get("registration_expires_at"),
-            createdAt=row.get("createdAt"),
-            updatedAt=row.get("updatedAt"),
-        )
+            rd = _row_as_dict(row)
+            vehicle = VehiclePayload(
+                id=str(rd["id"]),
+                driverId=str(rd["driverId"]) if rd.get("driverId") is not None else None,
+                plateNumber=rd.get("plateNumber"),
+                make=rd.get("make"),
+                model=rd.get("model"),
+                year=rd.get("year"),
+                displayName=" ".join(
+                    p
+                    for p in [
+                        str(rd.get("year")) if rd.get("year") else "",
+                        rd.get("make") or "",
+                        rd.get("model") or "",
+                    ]
+                    if p
+                ).strip()
+                or None,
+                type=rd.get("type"),
+                color=rd.get("color"),
+                vin=rd.get("vin"),
+                mileage=rd.get("mileage"),
+                fuelType=rd.get("fuel_type"),
+                imageUrl=rd.get("image_url"),
+                insuranceDocumentUrl=rd.get("insurance_document_url"),
+                insuranceExpiresAt=rd.get("insurance_expires_at"),
+                registrationDocumentUrl=rd.get("registration_document_url"),
+                registrationExpiresAt=rd.get("registration_expires_at"),
+                createdAt=rd.get("createdAt"),
+                updatedAt=rd.get("updatedAt"),
+            )
 
-        health_row = db.execute(text(health_sql), {"vehicle_id": vehicle_id}).mappings().first()
-        health = _health_from_db(health_row["health"]) if health_row and "health" in health_row else None
-        return vehicle, health
+            health_row = db.execute(text(health_sql), {"vehicle_id": vehicle_id}).mappings().first()
+            hd = _row_as_dict(health_row) if health_row is not None else {}
+            health = _health_from_db(hd["health"]) if hd.get("health") is not None else None
+            return vehicle, health
+    except SQLAlchemyError:
+        # Chat DB may be SQLite or missing Prisma tables (Vehicle / VehicleMaintenanceHealth).
+        return None, None
 
 
 def resolve_context_hybrid(
@@ -409,6 +418,19 @@ def _norm_token(value: str | None) -> str:
     if not value:
         return ""
     return " ".join("".join(ch if ch.isalnum() else " " for ch in str(value).lower()).split())
+
+
+def _row_as_dict(row: Any) -> Dict[str, Any]:
+    if row is None:
+        return {}
+    if isinstance(row, dict):
+        return row
+    if hasattr(row, "_mapping"):
+        return dict(row._mapping)
+    try:
+        return dict(row)
+    except (TypeError, ValueError):
+        return {}
 
 
 def resolve_candidate_manual_ids(
@@ -446,8 +468,8 @@ def resolve_candidate_manual_ids(
     try:
         with session_for_prisma_reads() as db:
             rows = db.execute(text(sql), {"mk": mk, "mdl": mdl, "yr": yr, "ctx": ctx}).mappings().all()
-    except Exception:
-        # Keep chat available even when Prisma tables are unavailable/misconfigured.
+    except SQLAlchemyError:
+        # Wrong dialect (e.g. SQLite), missing EducationContent, or column mismatch.
         return []
 
     def score(title: str) -> tuple[int, int]:
@@ -456,10 +478,14 @@ def resolve_candidate_manual_ids(
         broad = int(bool(ctx and ctx in t))
         return exact, broad
 
-    ranked = sorted(rows, key=lambda r: score(str(r.get("title") or "")), reverse=True)
+    ranked = sorted(
+        rows,
+        key=lambda r: score(str(_row_as_dict(r).get("title") or "")),
+        reverse=True,
+    )
     out: List[str] = []
     for r in ranked:
-        rid = str(r.get("id") or "").strip()
+        rid = str(_row_as_dict(r).get("id") or "").strip()
         if rid and rid not in out:
             out.append(rid)
         if len(out) >= limit:
