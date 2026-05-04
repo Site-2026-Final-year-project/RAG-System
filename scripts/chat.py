@@ -226,6 +226,32 @@ OUTPUT QUALITY
 """.strip()
 
 
+def _normalize_chat_query(query: str) -> str:
+    return " ".join(re.sub(r"[^\w\s]", " ", query.lower()).strip().split())
+
+
+def _is_identity_or_meta_query(query: str) -> bool:
+    """True for questions about the assistant itself — never run manual retrieval on these."""
+    q = _normalize_chat_query(query)
+    if len(q) > 140:
+        return False
+    patterns = (
+        r"^who\s+are\s+you\b",
+        r"^who\s+r\s+u\b",
+        r"^what\s+are\s+you\s*(\?|$)",
+        r"^what\s*(?:'s|s|is)\s+your\s+name\b",
+        r"^what\s+should\s+i\s+call\s+you\b",
+        r"^introduce\s+yourself\b",
+        r"^tell\s+me\s+about\s+yourself\b",
+        r"^what\s+(?:do\s+you\s+do|can\s+you\s+do|can\s+you\s+help(?:\s+with)?|are\s+you\s+for)\b",
+        r"^how\s+can\s+you\s+help\b",
+        r"^are\s+you\s+(?:a\s+)?(?:bot|ai|assistant|chatgpt)\b",
+        r"^what\s+is\s+your\s+purpose\b",
+        r"^do\s+you\s+work\s+for\b",
+    )
+    return any(re.search(p, q) for p in patterns)
+
+
 class RAGAssistant:
     def __init__(
         self,
@@ -443,14 +469,52 @@ class RAGAssistant:
 
         if q in greetings or q_alpha in greetings:
             return (
-                "Hi! I can help with your vehicle health, symptoms, and manual-based guidance. "
-                "Tell me what issue you are seeing."
+                "**Quick answer**\n\n"
+                "Hi — I’m **CarCare AI**, your vehicle helper.\n\n"
+                "**Steps**\n\n"
+                "1. Tell me your **symptom** or question.\n"
+                "2. Add **year / make / model** if you know them.\n\n"
+                "**What to have ready**\n\n"
+                "- Any **warning lights**\n"
+                "- **When** it happens\n\n"
+                "**Next best action**\n\n"
+                "Describe what you’re seeing on your car."
             )
         if q in thanks or q_alpha in thanks:
-            return "You are welcome. If you want, share your car issue and I will help step by step."
+            return (
+                "**Quick answer**\n\n"
+                "Glad to help.\n\n"
+                "**Next best action**\n\n"
+                "If anything else comes up with your car, tell me the symptom and vehicle details."
+            )
         if q in bye or q_alpha in bye:
-            return "Goodbye. Drive safe!"
+            return (
+                "**Quick answer**\n\n"
+                "Take care — drive safe.\n\n"
+                "**Safety**\n\n"
+                "If a warning light or unusual smell/smoke appears, pull over when safe and get professional help."
+            )
         return None
+
+    def _identity_intro_reply(self) -> str:
+        return (
+            "**Quick answer**\n\n"
+            "I’m **CarCare AI** — a practical, safety-first assistant for drivers.\n\n"
+            "**What I help with**\n\n"
+            "1. Maintenance basics and service intervals\n"
+            "2. Safe troubleshooting when something feels wrong\n"
+            "3. Understanding dashboard warnings and owner-manual-style guidance (when available)\n\n"
+            "**What to tell me**\n\n"
+            "- **Year / make / model**\n"
+            "- **Symptom** (noise, smell, light, leak, vibration)\n"
+            "- **When** it happens\n\n"
+            "**Important**\n\n"
+            "- I **don’t** have live sensor/OBD data unless your app sends it in context.\n"
+            "- For **brake/steering failures**, **strong burning smells**, **smoke**, **overheating**, or **fuel odor**: "
+            "**Do not continue driving** — get professional help.\n\n"
+            "**Next best action**\n\n"
+            "What’s going on with your car today?"
+        )
 
     def _wants_vehicle_status(self, query: str) -> bool:
         q = " ".join(re.sub(r"[^\w\s]", " ", query.lower()).split())
@@ -511,6 +575,7 @@ class RAGAssistant:
 {CARCARE_PERSONA_PROMPT}
 
 ADDITIONAL TECHNICAL MODE RULES
+- If the user asks who you are, what you are, or your name: answer as **CarCare AI**; **do not** dump unrelated manual excerpts.
 - Use correct automotive terminology and stay factual.
 - If a Vehicle profile snapshot lists maintenance-health percentages, report them accurately.
 - Do NOT invent DTCs, measurements, or specs.
@@ -530,6 +595,8 @@ Answer:
 {CARCARE_PERSONA_PROMPT}
 
 ADDITIONAL RESPONSE RULES
+- If the user asks who you are, what you are, or your name: answer as **CarCare AI** in plain language; **do not**
+  paste unrelated numbered lists from manuals.
 - Answer using the context below.
 - When context includes a Vehicle profile snapshot, treat those vehicle facts and percentages as authoritative.
 - Use manual excerpts as supporting detail for procedures and warnings.
@@ -644,6 +711,9 @@ Answer:
         quick = self._quick_smalltalk(query)
         if quick is not None:
             return quick
+
+        if _is_identity_or_meta_query(query):
+            return self._identity_intro_reply()
 
         active_context = car_context.strip() if car_context.strip() else self.car_context
         if self.user_model and self.has_user_index:
