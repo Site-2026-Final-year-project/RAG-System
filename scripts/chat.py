@@ -475,7 +475,7 @@ Answer:
         return f"""
 You are a professional automotive advisor for a driver-assistance product.
 
-Answer using the context below. When the context includes a **Garage profile snapshot**, treat numeric health
+Answer using the context below. When the context includes a **Vehicle profile snapshot**, treat numeric health
 percentages and vehicle facts from that section as authoritative for “how is my car” style questions.
 
 Guidelines:
@@ -637,7 +637,7 @@ Answer:
         context = manual_block[:2500]
         if snap:
             context = (
-                f"(Garage profile snapshot — factual vehicle state)\n{snap[:2400]}\n\n"
+                f"(Vehicle profile snapshot — factual vehicle state)\n{snap[:2400]}\n\n"
                 f"(Owner manual excerpts)\n{context}"
             )
         if active_context:
