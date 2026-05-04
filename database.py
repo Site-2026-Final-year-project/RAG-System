@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, create_engine, event
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, create_engine, event, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 try:
@@ -18,13 +19,22 @@ except ImportError:
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./models/chat_history.db")
 
+_log = logging.getLogger(__name__)
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
 def is_postgres_url(url: str) -> bool:
-    return url.startswith("postgresql://") or url.startswith("postgresql+psycopg://")
+    """True for Postgres URLs SQLAlchemy accepts, including legacy ``postgres://`` (common on Render/Heroku)."""
+    if not url:
+        return False
+    if url.startswith("sqlite:"):
+        return False
+    head = url.split("://", 1)[0].lower()
+    # postgres:// and postgresql://*, postgresql+psycopg://*, etc.
+    return head == "postgres" or head.startswith("postgresql")
 
 
 class Base(DeclarativeBase):
@@ -182,4 +192,28 @@ def create_all_tables() -> None:
         )
 
 
+def ensure_postgres_chat_schema() -> None:
+    """
+    SQLAlchemy create_all() does NOT add new columns to existing tables.
+
+    Deployed DBs created before `vehicle_id` / composite indexes will 500 on every query unless we ALTER.
+    Safe to run repeatedly (IF NOT EXISTS).
+    """
+    if not is_postgres_url(DATABASE_URL):
+        return
+    ddl = [
+        "ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS vehicle_id VARCHAR(36)",
+        "CREATE INDEX IF NOT EXISTS ix_chat_sessions_vehicle_id ON chat_sessions (vehicle_id)",
+        "CREATE INDEX IF NOT EXISTS ix_chat_sessions_user_updated ON chat_sessions (user_id, updated_at DESC)",
+        "CREATE INDEX IF NOT EXISTS ix_chat_messages_session_created_id ON chat_messages (session_id, created_at DESC, id DESC)",
+    ]
+    for stmt in ddl:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(stmt))
+        except Exception as exc:
+            _log.warning("ensure_postgres_chat_schema failed (%s): %s", stmt[:96], exc)
+
+
 create_all_tables()
+ensure_postgres_chat_schema()

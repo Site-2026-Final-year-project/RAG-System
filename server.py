@@ -1,22 +1,32 @@
 from __future__ import annotations
 
-import base64
-import json
+import logging
+from contextlib import asynccontextmanager
 import os
+import traceback
 import uuid
 from datetime import datetime, timezone
-from typing import Annotated, Any, Dict, List, Literal, Tuple
+from typing import Annotated, Any, Dict, List, Literal
 
 import jwt
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, desc, or_, select, text
+from sqlalchemy import desc, select, text
 from sqlalchemy.exc import SQLAlchemyError
 
-from database import ChatMessageModel, ChatSessionModel, SessionLocal, session_for_prisma_reads
+from database import (
+    ChatMessageModel,
+    ChatSessionModel,
+    SessionLocal,
+    ensure_postgres_chat_schema,
+    session_for_prisma_reads,
+)
 from scripts.chat import RAGAssistant
+
+logger = logging.getLogger("rag")
 
 
 def utcnow() -> datetime:
@@ -29,32 +39,6 @@ JWT_AUDIENCE = os.environ.get("JWT_AUDIENCE", "").strip() or None
 JWT_ISSUER = os.environ.get("JWT_ISSUER", "").strip() or None
 
 bearer_scheme = HTTPBearer(auto_error=False)
-
-
-def _b64url_decode_padded(s: str) -> bytes:
-    pad = 4 - len(s) % 4
-    if pad != 4:
-        s += "=" * pad
-    return base64.urlsafe_b64decode(s.encode("ascii"))
-
-
-def encode_before_cursor(created_at: datetime, message_id: str) -> str:
-    payload = {"t": created_at.isoformat(), "id": message_id}
-    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-
-
-def decode_before_cursor(cursor: str) -> Tuple[datetime, str]:
-    try:
-        raw = _b64url_decode_padded(cursor)
-        data = json.loads(raw.decode("utf-8"))
-        ts = datetime.fromisoformat(str(data["t"]))
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        mid = str(data["id"])
-        return ts, mid
-    except (json.JSONDecodeError, KeyError, ValueError, UnicodeDecodeError) as e:
-        raise HTTPException(status_code=400, detail=f"Invalid before cursor: {e}") from e
 
 
 def get_current_user_id(
@@ -165,12 +149,6 @@ class ChatMessageResponse(BaseModel):
     role: Literal["user", "assistant", "system"]
     content: str
     created_at: datetime
-
-
-class MessagesPageResponse(BaseModel):
-    items: List[ChatMessageResponse]
-    next_before: str | None = None
-    has_more: bool = False
 
 
 _assistant_cache: Dict[str, RAGAssistant] = {}
@@ -501,7 +479,13 @@ def get_owned_session_or_404(session_id: str, user_id: str) -> ChatSessionModel:
         return session
 
 
-app = FastAPI(title="RAG Chat History API", version="1.0.0")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    ensure_postgres_chat_schema()
+    yield
+
+
+app = FastAPI(title="RAG Chat History API", version="1.0.0", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -510,6 +494,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def unhandled_exception_logger(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+        dbg = os.environ.get("RAG_DEBUG", "").strip().lower() in ("1", "true", "yes")
+        payload: Dict[str, Any] = {"detail": "Internal server error"}
+        if dbg:
+            payload["detail"] = str(exc)
+            payload["type"] = type(exc).__name__
+            payload["trace"] = traceback.format_exc()[-8000:]
+        return JSONResponse(status_code=500, content=payload)
 
 
 @app.get("/")
@@ -580,21 +581,12 @@ def delete_session(
     return Response(status_code=204)
 
 
-@app.get("/sessions/{session_id}/messages", response_model=MessagesPageResponse)
+@app.get("/sessions/{session_id}/messages", response_model=List[ChatMessageResponse])
 def list_messages(
     session_id: str,
     user_id: Annotated[str, Depends(get_current_user_id)],
     limit: int = Query(default=50, ge=1, le=200),
-    before: str | None = Query(
-        default=None,
-        description="Opaque cursor from a previous response's next_before; loads older messages.",
-    ),
-) -> MessagesPageResponse:
-    anchor_ts: datetime | None = None
-    anchor_id: str | None = None
-    if before:
-        anchor_ts, anchor_id = decode_before_cursor(before)
-
+) -> List[ChatMessageResponse]:
     with SessionLocal() as db:
         owns = db.scalar(
             select(ChatSessionModel.id)
@@ -603,29 +595,16 @@ def list_messages(
         )
         if owns is None:
             raise HTTPException(status_code=404, detail="Session not found")
-        q = select(ChatMessageModel).where(ChatMessageModel.session_id == session_id)
-        if anchor_ts is not None and anchor_id is not None:
-            q = q.where(
-                or_(
-                    ChatMessageModel.created_at < anchor_ts,
-                    and_(ChatMessageModel.created_at == anchor_ts, ChatMessageModel.id < anchor_id),
-                )
-            )
-        q = q.order_by(desc(ChatMessageModel.created_at), desc(ChatMessageModel.id)).limit(limit + 1)
+        q = (
+            select(ChatMessageModel)
+            .where(ChatMessageModel.session_id == session_id)
+            .order_by(desc(ChatMessageModel.created_at), desc(ChatMessageModel.id))
+            .limit(limit)
+        )
         rows = list(db.scalars(q).all())
 
-    has_more = len(rows) > limit
-    page_rows = rows[:limit]
-
-    items_chrono = list(reversed(page_rows))
-    items = [to_message_response(m) for m in items_chrono]
-
-    next_before: str | None = None
-    if has_more and items_chrono:
-        oldest = items_chrono[0]
-        next_before = encode_before_cursor(oldest.created_at, oldest.id)
-
-    return MessagesPageResponse(items=items, next_before=next_before, has_more=has_more)
+    items_chrono = list(reversed(rows))
+    return [to_message_response(m) for m in items_chrono]
 
 
 @app.post("/sessions/{session_id}/messages")
@@ -676,17 +655,28 @@ def send_message(
     else:
         session_title = None
 
-    assistant = get_assistant(
-        user_id=session.user_id,
-        car_context=active_context,
-        use_user_manual=payload.use_user_manual,
-    )
-    answer = assistant.generate_answer(
-        text,
-        car_context=active_context,
-        priority_context=detailed_ctx,
-        manual_ids=manual_ids,
-    )
+    try:
+        assistant = get_assistant(
+            user_id=session.user_id,
+            car_context=active_context,
+            use_user_manual=payload.use_user_manual,
+        )
+        answer = assistant.generate_answer(
+            text,
+            car_context=active_context,
+            priority_context=detailed_ctx,
+            manual_ids=manual_ids,
+        )
+    except RuntimeError as exc:
+        # Typical on Render: local LLM weights failed to load (set LLM_PROVIDER=hf_space or RAG_REMOTE_LLM_URL).
+        logger.exception("RAG assistant failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Assistant unavailable (model/embeddings failed to load). "
+                "On low-memory hosts set LLM_PROVIDER=hf_space or RAG_REMOTE_LLM_URL."
+            ),
+        ) from exc
 
     with SessionLocal() as db:
         assistant_message = ChatMessageModel(
