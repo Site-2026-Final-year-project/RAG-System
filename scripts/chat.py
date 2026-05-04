@@ -431,7 +431,7 @@ class RAGAssistant:
         out: List[str] = [
             f"**Vehicle status — {label}**",
             "",
-            "Summary from your **saved garage profile** (latest maintenance-health snapshot). "
+            "Summary from your **saved vehicle profile** (latest maintenance-health snapshot). "
             "This reflects calculated maintenance scores, not live OBD readings.",
             "",
         ]
@@ -451,13 +451,17 @@ class RAGAssistant:
             return f"""
 You are an expert automotive assistant for a production driver app.
 
-Provide a precise answer from the context. If a garage profile snapshot lists maintenance-health percentages,
+Provide a precise answer from the context. If a vehicle profile snapshot lists maintenance-health percentages,
 report them accurately before citing manual excerpts.
 
 Guidelines:
 - Use correct automotive terminology; stay factual.
+- Use correct vehicle terminology; stay factual.
 - Do NOT repeat the question; do NOT invent DTCs or measurements.
 - If unsure, say what is missing.
+- Do not promote the manuals brand or name; focus on the content.
+- Do not say "I am not certain" if you are uncertain about the answer; say what is missing and Ask the user to provide more information.
+- Do not make it obvious that you are using the manuals to answer the question; focus on the content.
 
 Context:
 {context}
@@ -471,17 +475,20 @@ Answer:
         return f"""
 You are a professional automotive advisor for a driver-assistance product.
 
-Answer using the context below. When the context includes a **Garage profile snapshot**, treat numeric health
+Answer using the context below. When the context includes a **Vehicle profile snapshot**, treat numeric health
 percentages and vehicle facts from that section as authoritative for “how is my car” style questions.
 
 Guidelines:
 - Sound calm, precise, and professional (service-advisor tone).
 - Lead with concrete facts (percentages, mileage, plate if present), then brief interpretation.
 - Use manual excerpts only as supporting detail for procedures or warnings.
-- If manual excerpts are missing, still answer from the garage snapshot when present.
+- If manual excerpts are missing, still answer from the  snapshot when present.
 - Do NOT repeat the user question verbatim.
 - Do NOT invent sensors, DTC codes, or measurements not in the context.
 - If information is insufficient, say what is missing in one sentence.
+- Do not promote the manuals brand or name; focus on the content.
+- Do not say "I am not certain" if you are uncertain about the answer; say what is missing and Ask the user to provide more information.
+- Do not make it obvious that you are using the manuals to answer the question; focus on the content.
 
 Context:
 {context}
@@ -630,7 +637,7 @@ Answer:
         context = manual_block[:2500]
         if snap:
             context = (
-                f"(Garage profile snapshot — factual vehicle state)\n{snap[:2400]}\n\n"
+                f"(Vehicle profile snapshot — factual vehicle state)\n{snap[:2400]}\n\n"
                 f"(Owner manual excerpts)\n{context}"
             )
         if active_context:
