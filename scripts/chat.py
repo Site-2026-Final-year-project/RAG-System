@@ -7,7 +7,7 @@ import sys
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Sequence
 import re
 
 import requests
@@ -275,7 +275,13 @@ class RAGAssistant:
             normalize_embeddings=False,
         ).astype(np.float32)
 
-    def _retrieve_once(self, q_emb: np.ndarray, config: RetrievalConfig) -> tuple[List[str], List[str]]:
+    def _retrieve_once(
+        self,
+        q_emb: np.ndarray,
+        config: RetrievalConfig,
+        *,
+        manual_ids: Sequence[str] | None = None,
+    ) -> tuple[List[str], List[str]]:
         user_results: List[str] = []
         global_results: List[str] = []
         if self._use_pgvector:
@@ -294,6 +300,7 @@ class RAGAssistant:
                     owner_user_id=None,
                     query_embedding=q_emb,
                     k=config.k_global,
+                    manual_ids=manual_ids,
                 )
         else:
             if self.user_index is not None and self.user_docs:
@@ -307,6 +314,7 @@ class RAGAssistant:
         config: RetrievalConfig | None = None,
         car_context: str = "",
         priority_context: str = "",
+        manual_ids: Sequence[str] | None = None,
     ) -> List[str]:
         config = config or RetrievalConfig()
         ctx = car_context.strip() if car_context.strip() else self.car_context
@@ -326,16 +334,33 @@ class RAGAssistant:
 
         merged: List[str] = []
         seen_queries: set[str] = set()
+        target_limit = config.k_user + config.k_global
         for q in candidate_queries:
             if not q or q in seen_queries:
                 continue
             seen_queries.add(q)
             q_emb = self._embed_query(q)
-            user_results, global_results = self._retrieve_once(q_emb, config)
+            user_results: List[str] = []
+            global_results: List[str] = []
+            if manual_ids and self._use_pgvector:
+                # Step 1: strict manual-targeted retrieval (exact/near vehicle manual candidates).
+                user_results, global_results = self._retrieve_once(
+                    q_emb,
+                    RetrievalConfig(k_user=config.k_user, k_global=max(1, config.k_global - 1)),
+                    manual_ids=manual_ids,
+                )
+                if len(user_results) + len(global_results) < max(2, target_limit // 2):
+                    # Step 2: bounded fallback to full global set when targeted subset is sparse.
+                    _, global_fallback = self._retrieve_once(q_emb, RetrievalConfig(k_user=0, k_global=2))
+                    for c in global_fallback:
+                        if c and c not in global_results:
+                            global_results.append(c)
+            else:
+                user_results, global_results = self._retrieve_once(q_emb, config)
             for c in user_results + global_results:
                 if c and c not in merged:
                     merged.append(c)
-            if len(merged) >= (config.k_user + config.k_global):
+            if len(merged) >= target_limit:
                 break
 
         return merged
@@ -554,7 +579,13 @@ Answer:
             return str(result.get("answer") or "").strip()
         return str(result).strip()
 
-    def generate_answer(self, query: str, car_context: str = "", priority_context: str = "") -> str:
+    def generate_answer(
+        self,
+        query: str,
+        car_context: str = "",
+        priority_context: str = "",
+        manual_ids: Sequence[str] | None = None,
+    ) -> str:
         quick = self._quick_smalltalk(query)
         if quick is not None:
             return quick
@@ -573,6 +604,7 @@ Answer:
                     config=RetrievalConfig(k_user=2, k_global=3),
                     car_context=car_context,
                     priority_context=priority_context,
+                    manual_ids=manual_ids,
                 )
                 reply = self._vehicle_status_reply_from_priority(snap, active_context)
                 if context_chunks:
@@ -588,6 +620,7 @@ Answer:
             config=RetrievalConfig(k_user=2, k_global=3),
             car_context=car_context,
             priority_context=priority_context,
+            manual_ids=manual_ids,
         )
         manual_block = (
             "No matching owner-manual excerpts were retrieved."

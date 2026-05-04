@@ -14,7 +14,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, desc, or_, select, text
 
-from database import ChatMessageModel, ChatSessionModel, SessionLocal
+from database import ChatMessageModel, ChatSessionModel, SessionLocal, session_for_prisma_reads
 from scripts.chat import RAGAssistant
 
 
@@ -405,6 +405,68 @@ def resolve_context_hybrid(
     return normalize_vehicle_context(shadow)
 
 
+def _norm_token(value: str | None) -> str:
+    if not value:
+        return ""
+    return " ".join("".join(ch if ch.isalnum() else " " for ch in str(value).lower()).split())
+
+
+def resolve_candidate_manual_ids(
+    *,
+    make: str | None,
+    model: str | None,
+    year: int | None,
+    car_context: str,
+    limit: int = 4,
+) -> List[str]:
+    """
+    Rank likely manual ids from EducationContent using vehicle identity.
+    Strategy: exact make+model+year, then make+model, then make/context fallback.
+    """
+    mk = _norm_token(make)
+    mdl = _norm_token(model)
+    yr = str(year).strip() if year else ""
+    ctx = _norm_token(car_context)
+    if not any([mk, mdl, yr, ctx]):
+        return []
+
+    # Query by title first because uploaded manuals are titled with make/model/year.
+    sql = """
+    SELECT id, title
+    FROM "EducationContent"
+    WHERE pdf_url IS NOT NULL
+      AND category::text = 'MANUALS'
+      AND (
+        (:mk = '' OR lower(title) LIKE '%' || :mk || '%')
+        OR (:mdl = '' OR lower(title) LIKE '%' || :mdl || '%')
+        OR (:yr = '' OR lower(title) LIKE '%' || :yr || '%')
+        OR (:ctx = '' OR lower(title) LIKE '%' || :ctx || '%')
+      )
+    """
+    try:
+        with session_for_prisma_reads() as db:
+            rows = db.execute(text(sql), {"mk": mk, "mdl": mdl, "yr": yr, "ctx": ctx}).mappings().all()
+    except Exception:
+        # Keep chat available even when Prisma tables are unavailable/misconfigured.
+        return []
+
+    def score(title: str) -> tuple[int, int]:
+        t = _norm_token(title)
+        exact = int(bool(mk and mk in t)) + int(bool(mdl and mdl in t)) + int(bool(yr and yr in t))
+        broad = int(bool(ctx and ctx in t))
+        return exact, broad
+
+    ranked = sorted(rows, key=lambda r: score(str(r.get("title") or "")), reverse=True)
+    out: List[str] = []
+    for r in ranked:
+        rid = str(r.get("id") or "").strip()
+        if rid and rid not in out:
+            out.append(rid)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def get_owned_session_or_404(session_id: str, user_id: str) -> ChatSessionModel:
     with SessionLocal() as db:
         session = db.get(ChatSessionModel, session_id)
@@ -502,14 +564,19 @@ def list_messages(
         description="Opaque cursor from a previous response's next_before; loads older messages.",
     ),
 ) -> MessagesPageResponse:
-    get_owned_session_or_404(session_id, user_id)
-
     anchor_ts: datetime | None = None
     anchor_id: str | None = None
     if before:
         anchor_ts, anchor_id = decode_before_cursor(before)
 
     with SessionLocal() as db:
+        owns = db.scalar(
+            select(ChatSessionModel.id)
+            .where(ChatSessionModel.id == session_id, ChatSessionModel.user_id == user_id)
+            .limit(1)
+        )
+        if owns is None:
+            raise HTTPException(status_code=404, detail="Session not found")
         q = select(ChatMessageModel).where(ChatMessageModel.session_id == session_id)
         if anchor_ts is not None and anchor_id is not None:
             q = q.where(
@@ -568,6 +635,16 @@ def send_message(
         payload, user_id, fallback_vehicle_id=merged_vid or None
     )
     active_context = short_ctx or session.car_context
+    vehicle_db, _ = fetch_vehicle_context_from_db(merged_vid, user_id)
+    vehicle_context = getattr(payload, "vehicle_context", None)
+    vehicle_flutter = (vehicle_context.vehicle if vehicle_context else None) or getattr(payload, "vehicle", None)
+    vehicle_for_manual = vehicle_db or vehicle_flutter
+    manual_ids = resolve_candidate_manual_ids(
+        make=(vehicle_for_manual.make if vehicle_for_manual else None),
+        model=(vehicle_for_manual.model if vehicle_for_manual else None),
+        year=(vehicle_for_manual.year if vehicle_for_manual else None),
+        car_context=active_context,
+    )
     if payload.title and payload.title.strip():
         session_title = payload.title.strip()
     else:
@@ -582,6 +659,7 @@ def send_message(
         text,
         car_context=active_context,
         priority_context=detailed_ctx,
+        manual_ids=manual_ids,
     )
 
     with SessionLocal() as db:
