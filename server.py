@@ -14,7 +14,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, desc, or_, select, text
 
-from database import ChatMessageModel, ChatSessionModel, SessionLocal
+from database import ChatMessageModel, ChatSessionModel, SessionLocal, session_for_prisma_reads
 from scripts.chat import RAGAssistant
 
 
@@ -153,6 +153,7 @@ class ChatSessionResponse(BaseModel):
     user_id: str
     title: str
     car_context: str
+    vehicle_id: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -199,6 +200,7 @@ def to_session_response(session: ChatSessionModel) -> ChatSessionResponse:
         user_id=session.user_id,
         title=session.title,
         car_context=session.car_context,
+        vehicle_id=getattr(session, "vehicle_id", None),
         created_at=session.created_at,
         updated_at=session.updated_at,
     )
@@ -250,13 +252,15 @@ def normalize_vehicle_context(payload: Any) -> tuple[str, str]:
 
     priority_lines: List[str] = []
     if health is not None:
-        priority_lines.append(f"Vehicle health overall: {health.overallPercent}%")
+        priority_lines.append(f"Overall maintenance health: {health.overallPercent}%")
         if health.summary:
-            priority_lines.append(f"Health summary: {health.summary.strip()}")
+            priority_lines.append(f"Summary: {health.summary.strip()}")
+        for c in sorted(health.components, key=lambda x: (x.label or "").lower()):
+            priority_lines.append(f"{c.label}: {c.percent}%")
         concerning = [c for c in health.components if c.percent <= 60]
         if concerning:
-            issues = ", ".join(f"{c.label} {c.percent}%" for c in concerning)
-            priority_lines.append(f"Priority issues: {issues}")
+            issues = ", ".join(f"{c.label} at {c.percent}%" for c in concerning)
+            priority_lines.append(f"Needs attention: {issues}")
 
     if manual_context:
         parts.append(f"Driver context: {manual_context}")
@@ -376,8 +380,10 @@ def fetch_vehicle_context_from_db(vehicle_id: str, user_id: str) -> tuple[Vehicl
         return vehicle, health
 
 
-def resolve_context_hybrid(payload: Any, user_id: str) -> tuple[str, str]:
-    vehicle_id = _extract_vehicle_id(payload)
+def resolve_context_hybrid(
+    payload: Any, user_id: str, *, fallback_vehicle_id: str | None = None
+) -> tuple[str, str]:
+    vehicle_id = (_extract_vehicle_id(payload) or "").strip() or (fallback_vehicle_id or "").strip()
     vehicle_db, health_db = fetch_vehicle_context_from_db(vehicle_id, user_id)
 
     vehicle_context = getattr(payload, "vehicle_context", None)
@@ -397,6 +403,68 @@ def resolve_context_hybrid(payload: Any, user_id: str) -> tuple[str, str]:
     shadow.vehicle_health = health
     shadow.car_context = manual_context
     return normalize_vehicle_context(shadow)
+
+
+def _norm_token(value: str | None) -> str:
+    if not value:
+        return ""
+    return " ".join("".join(ch if ch.isalnum() else " " for ch in str(value).lower()).split())
+
+
+def resolve_candidate_manual_ids(
+    *,
+    make: str | None,
+    model: str | None,
+    year: int | None,
+    car_context: str,
+    limit: int = 4,
+) -> List[str]:
+    """
+    Rank likely manual ids from EducationContent using vehicle identity.
+    Strategy: exact make+model+year, then make+model, then make/context fallback.
+    """
+    mk = _norm_token(make)
+    mdl = _norm_token(model)
+    yr = str(year).strip() if year else ""
+    ctx = _norm_token(car_context)
+    if not any([mk, mdl, yr, ctx]):
+        return []
+
+    # Query by title first because uploaded manuals are titled with make/model/year.
+    sql = """
+    SELECT id, title
+    FROM "EducationContent"
+    WHERE pdf_url IS NOT NULL
+      AND category::text = 'MANUALS'
+      AND (
+        (:mk = '' OR lower(title) LIKE '%' || :mk || '%')
+        OR (:mdl = '' OR lower(title) LIKE '%' || :mdl || '%')
+        OR (:yr = '' OR lower(title) LIKE '%' || :yr || '%')
+        OR (:ctx = '' OR lower(title) LIKE '%' || :ctx || '%')
+      )
+    """
+    try:
+        with session_for_prisma_reads() as db:
+            rows = db.execute(text(sql), {"mk": mk, "mdl": mdl, "yr": yr, "ctx": ctx}).mappings().all()
+    except Exception:
+        # Keep chat available even when Prisma tables are unavailable/misconfigured.
+        return []
+
+    def score(title: str) -> tuple[int, int]:
+        t = _norm_token(title)
+        exact = int(bool(mk and mk in t)) + int(bool(mdl and mdl in t)) + int(bool(yr and yr in t))
+        broad = int(bool(ctx and ctx in t))
+        return exact, broad
+
+    ranked = sorted(rows, key=lambda r: score(str(r.get("title") or "")), reverse=True)
+    out: List[str] = []
+    for r in ranked:
+        rid = str(r.get("id") or "").strip()
+        if rid and rid not in out:
+            out.append(rid)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def get_owned_session_or_404(session_id: str, user_id: str) -> ChatSessionModel:
@@ -433,13 +501,15 @@ def create_session(
     payload: CreateSessionRequest,
     user_id: Annotated[str, Depends(get_current_user_id)],
 ) -> ChatSessionResponse:
-    short_ctx, _ = resolve_context_hybrid(payload, user_id)
+    vid = (_extract_vehicle_id(payload) or "").strip() or None
+    short_ctx, _ = resolve_context_hybrid(payload, user_id, fallback_vehicle_id=vid)
     now = utcnow()
     session = ChatSessionModel(
         id=str(uuid.uuid4()),
         user_id=user_id,
         title=((payload.title or "").strip() or "New chat"),
         car_context=short_ctx,
+        vehicle_id=vid,
         created_at=now,
         updated_at=now,
     )
@@ -494,14 +564,19 @@ def list_messages(
         description="Opaque cursor from a previous response's next_before; loads older messages.",
     ),
 ) -> MessagesPageResponse:
-    get_owned_session_or_404(session_id, user_id)
-
     anchor_ts: datetime | None = None
     anchor_id: str | None = None
     if before:
         anchor_ts, anchor_id = decode_before_cursor(before)
 
     with SessionLocal() as db:
+        owns = db.scalar(
+            select(ChatSessionModel.id)
+            .where(ChatSessionModel.id == session_id, ChatSessionModel.user_id == user_id)
+            .limit(1)
+        )
+        if owns is None:
+            raise HTTPException(status_code=404, detail="Session not found")
         q = select(ChatMessageModel).where(ChatMessageModel.session_id == session_id)
         if anchor_ts is not None and anchor_id is not None:
             q = q.where(
@@ -537,6 +612,8 @@ def send_message(
     if not text:
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
+    payload_vehicle_id = (_extract_vehicle_id(payload) or "").strip()
+
     with SessionLocal() as db:
         session = db.get(ChatSessionModel, session_id)
         if session is None or session.user_id != user_id:
@@ -553,8 +630,21 @@ def send_message(
         db.commit()
         db.refresh(user_message)
 
-    short_ctx, detailed_ctx = resolve_context_hybrid(payload, user_id)
+    merged_vid = payload_vehicle_id or (session.vehicle_id or "").strip()
+    short_ctx, detailed_ctx = resolve_context_hybrid(
+        payload, user_id, fallback_vehicle_id=merged_vid or None
+    )
     active_context = short_ctx or session.car_context
+    vehicle_db, _ = fetch_vehicle_context_from_db(merged_vid, user_id)
+    vehicle_context = getattr(payload, "vehicle_context", None)
+    vehicle_flutter = (vehicle_context.vehicle if vehicle_context else None) or getattr(payload, "vehicle", None)
+    vehicle_for_manual = vehicle_db or vehicle_flutter
+    manual_ids = resolve_candidate_manual_ids(
+        make=(vehicle_for_manual.make if vehicle_for_manual else None),
+        model=(vehicle_for_manual.model if vehicle_for_manual else None),
+        year=(vehicle_for_manual.year if vehicle_for_manual else None),
+        car_context=active_context,
+    )
     if payload.title and payload.title.strip():
         session_title = payload.title.strip()
     else:
@@ -569,6 +659,7 @@ def send_message(
         text,
         car_context=active_context,
         priority_context=detailed_ctx,
+        manual_ids=manual_ids,
     )
 
     with SessionLocal() as db:
@@ -586,6 +677,10 @@ def send_message(
             session_to_update.updated_at = utcnow()
             if active_context:
                 session_to_update.car_context = _shorten_context(active_context)
+            if payload_vehicle_id:
+                session_to_update.vehicle_id = payload_vehicle_id
+            elif merged_vid and not (session_to_update.vehicle_id or "").strip():
+                session_to_update.vehicle_id = merged_vid
             if session_title:
                 session_to_update.title = session_title
 

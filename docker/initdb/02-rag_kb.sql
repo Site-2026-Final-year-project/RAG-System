@@ -1,10 +1,5 @@
--- Run on the same PostgreSQL database used by your Express admin app.
--- Requires: CREATE privilege and ability to create extensions (or DBA runs CREATE EXTENSION once).
-
-CREATE EXTENSION IF NOT EXISTS vector;
-
--- Chunk store for RAG (global + per-user manuals). Express can INSERT rows and call the Python
--- embed/sync job, or use scripts/build_index.py and scripts/upload_manual.py to fill embeddings.
+-- RAG chunk store + vector index (runs once on empty Docker volume).
+-- Matches docs/schema_rag_pgvector.sql so retrieval stays fast after large manual syncs.
 
 CREATE TABLE IF NOT EXISTS rag_kb_chunks (
   id VARCHAR(36) PRIMARY KEY,
@@ -24,12 +19,9 @@ CREATE INDEX IF NOT EXISTS ix_rag_kb_chunks_scope_owner
 CREATE INDEX IF NOT EXISTS ix_rag_kb_chunks_manual
   ON rag_kb_chunks (manual_id);
 
--- Vector similarity (critical after large manual syncs; avoids full sequential scans per query).
 CREATE INDEX IF NOT EXISTS ix_rag_kb_chunks_embedding_hnsw
   ON rag_kb_chunks
   USING hnsw (embedding vector_l2_ops);
-
--- Optional vehicle hint per app user (replaces local models/<user>/meta.txt when using Postgres).
 
 CREATE TABLE IF NOT EXISTS rag_user_profile (
   user_id VARCHAR(128) PRIMARY KEY,

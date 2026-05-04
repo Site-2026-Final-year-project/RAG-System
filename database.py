@@ -6,7 +6,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engine, event
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 try:
@@ -33,17 +33,25 @@ class Base(DeclarativeBase):
 
 class ChatSessionModel(Base):
     __tablename__ = "chat_sessions"
+    __table_args__ = (
+        Index("ix_chat_sessions_user_updated", "user_id", "updated_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     user_id: Mapped[str] = mapped_column(String(128), index=True)
     title: Mapped[str] = mapped_column(String(255), default="New chat")
     car_context: Mapped[str] = mapped_column(String(255), default="")
+    # Links chat to Prisma Vehicle.id so every message can load maintenance health without client resending it.
+    vehicle_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
 class ChatMessageModel(Base):
     __tablename__ = "chat_messages"
+    __table_args__ = (
+        Index("ix_chat_messages_session_created_id", "session_id", "created_at", "id"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     session_id: Mapped[str] = mapped_column(

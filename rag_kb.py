@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Sequence
 
 import numpy as np
 from sqlalchemy import Select, delete, func, select
@@ -23,6 +23,7 @@ def search_kb_l2(
     owner_user_id: str | None,
     query_embedding: np.ndarray,
     k: int,
+    manual_ids: Sequence[str] | None = None,
 ) -> List[str]:
     """Return up to k chunk texts by L2 distance (matches former FAISS IndexFlatL2)."""
     q = query_embedding.astype(np.float64).flatten().tolist()
@@ -34,6 +35,8 @@ def search_kb_l2(
         stmt = stmt.where(RagKbChunkModel.owner_user_id.is_(None))
     else:
         stmt = stmt.where(RagKbChunkModel.owner_user_id == owner_user_id)
+    if manual_ids:
+        stmt = stmt.where(RagKbChunkModel.manual_id.in_(list(manual_ids)))
 
     stmt = stmt.order_by(RagKbChunkModel.embedding.l2_distance(q)).limit(k)
     rows = db.scalars(stmt).all()

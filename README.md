@@ -91,7 +91,8 @@ User identity comes from a JWT (recommended for Flutter production), not from th
 ### Endpoints
 
 - `POST /sessions`
-  - body: `{ "title": "My chat", "car_context": "Toyota Vios 2021" }`
+  - body: `{ "title": "My chat", "car_context": "2024 Honda Civic", "vehicle_id": "<Prisma Vehicle.id>" }`
+  - **`vehicle_id`** (recommended): persists on the session so every message can load **Vehicle** + **VehicleMaintenanceHealth** from Postgres without the client resending them. Run `docs/migrations/001_chat_sessions_vehicle_id.sql` once if your DB predates this column.
   - `user_id` is taken from JWT `sub` (or `X-User-Id` in dev).
 - `GET /sessions` — list sessions for the authenticated user
 - `GET /sessions/{session_id}` — session metadata (404 if not yours)
@@ -100,7 +101,8 @@ User identity comes from a JWT (recommended for Flutter production), not from th
   - First page: omit `before` to load the **latest** `limit` messages (chronological order in `items`).
   - Older messages: pass `before` from the previous response’s `next_before` until `has_more` is false.
 - `POST /sessions/{session_id}/messages`
-  - body: `{ "message": "What does ABS light mean?", "car_context": "", "use_user_manual": true }`
+  - body: `{ "message": "What does ABS light mean?", "car_context": "", "vehicle_id": "<optional override>", "vehicle_context": {...}, "use_user_manual": true }`
+  - If the session already has `vehicle_id`, you may omit it on each message.
 
 The `POST /sessions/{session_id}/messages` endpoint:
 1. stores the user message,
@@ -119,7 +121,10 @@ Retrieval no longer requires local FAISS files when `DATABASE_URL` points at **P
   - `RAG_KB_BACKEND=pgvector`: require Postgres + tables (fails fast if URL is not Postgres).
 
 - **Schema** (reference SQL): `docs/schema_rag_pgvector.sql`  
-  SQLAlchemy also creates compatible tables on startup when using Postgres.
+  Docker loads the same tables + **HNSW index** from `docker/initdb/02-rag_kb.sql` on first database init.
+- **Existing Postgres** (already full of chunks): create the vector index once —  
+  `export DATABASE_URL=... && python scripts/apply_vector_index.py`  
+  (or run `docs/migrations/002_rag_kb_chunks_embedding_hnsw.sql` with `CONCURRENTLY` during production maintenance).
 
 - **Sync global KB from this repo** (embeds + upserts global rows):
 
