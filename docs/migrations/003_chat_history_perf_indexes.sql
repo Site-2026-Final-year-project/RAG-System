@@ -5,8 +5,7 @@
 CREATE INDEX IF NOT EXISTS ix_chat_sessions_user_updated
   ON chat_sessions (user_id, updated_at DESC);
 
--- For cursor pagination in chat history:
--- WHERE session_id = ? AND (created_at,id) < (?,?) ORDER BY created_at DESC, id DESC
+-- For listing messages by session (ORDER BY created_at DESC, id DESC):
 CREATE INDEX IF NOT EXISTS ix_chat_messages_session_created_id
   ON chat_messages (session_id, created_at DESC, id DESC);
 

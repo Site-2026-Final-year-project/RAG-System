@@ -97,9 +97,7 @@ User identity comes from a JWT (recommended for Flutter production), not from th
 - `GET /sessions` — list sessions for the authenticated user
 - `GET /sessions/{session_id}` — session metadata (404 if not yours)
 - `DELETE /sessions/{session_id}` — delete session and all messages (204 No Content)
-- `GET /sessions/{session_id}/messages?limit=50&before=<cursor>`
-  - First page: omit `before` to load the **latest** `limit` messages (chronological order in `items`).
-  - Older messages: pass `before` from the previous response’s `next_before` until `has_more` is false.
+- `GET /sessions/{session_id}/messages?limit=50` — returns up to the latest `limit` messages in chronological order (JSON array).
 - `POST /sessions/{session_id}/messages`
   - body: `{ "message": "What does ABS light mean?", "car_context": "", "vehicle_id": "<optional override>", "vehicle_context": {...}, "use_user_manual": true }`
   - If the session already has `vehicle_id`, you may omit it on each message.
@@ -171,5 +169,5 @@ python scripts/sync_education_manuals.py --content-id <EducationContent.id>
 - **`EXPRESS_PROJECT_ROOT`**: absolute path to the Express repo so PDFs are read from disk (`uploads/education-manuals/<file>`). If files are not on this machine, the script tries **HTTP GET** on `pdf_url` (Express must be running and serving `/uploads`).
 - Re-run sync after admins add or replace a manual PDF.
 
-Optional Express checklist / Cursor prompt: `docs/EXPRESS_RAG_PROMPT.md`.
+Optional Express integration checklist: `docs/EXPRESS_RAG_PROMPT.md`.
 
