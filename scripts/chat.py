@@ -201,7 +201,7 @@ BOUNDARIES
 
 VEHICLE-AWARE BEHAVIOR
 - If vehicle details are provided, tailor answers to that vehicle.
-- If key details are missing, ask for only what is necessary (model/year/engine/transmission/symptom).
+- If key details are missing, ask for only what is necessary (symptom first; vehicle details only if not already provided in the app context).
 - If manual context exists, prefer manual-consistent guidance.
 
 FORMATTING RULES
@@ -469,50 +469,46 @@ class RAGAssistant:
 
         if q in greetings or q_alpha in greetings:
             return (
-                "**Quick answer**\n\n"
-                "Hi — I’m **CarCare AI**, your vehicle helper.\n\n"
-                "**Steps**\n\n"
-                "1. Tell me your **symptom** or question.\n"
-                "2. Add **year / make / model** if you know them.\n\n"
-                "**What to have ready**\n\n"
-                "- Any **warning lights**\n"
-                "- **When** it happens\n\n"
-                "**Next best action**\n\n"
-                "Describe what you’re seeing on your car."
+                "Hi — I’m **CarCare AI**, your safety-first vehicle assistant.\n\n"
+                "## Steps to follow\n"
+                "1. Tell me the **symptom** (noise, smell, warning light, leak, vibration).\n"
+                "2. Tell me **when it happens** (cold start, braking, turning, highway, bumps).\n\n"
+                "## What to check/prepare\n"
+                "- Any **dashboard warning lights** (which ones?)\n"
+                "- Any **recent work** (battery, brakes, oil change)\n\n"
+                "## Next best action\n"
+                "Describe what you’re seeing and I’ll guide you step-by-step."
             )
         if q in thanks or q_alpha in thanks:
             return (
-                "**Quick answer**\n\n"
                 "Glad to help.\n\n"
-                "**Next best action**\n\n"
-                "If anything else comes up with your car, tell me the symptom and vehicle details."
+                "## Next best action\n"
+                "If anything else comes up, tell me the **symptom** and **when it happens**."
             )
         if q in bye or q_alpha in bye:
             return (
-                "**Quick answer**\n\n"
                 "Take care — drive safe.\n\n"
-                "**Safety**\n\n"
-                "If a warning light or unusual smell/smoke appears, pull over when safe and get professional help."
+                "## Safety warning\n"
+                "If you notice **smoke**, **fuel smell**, **overheating**, or **brake/steering problems**, pull over when safe and get professional help."
             )
         return None
 
     def _identity_intro_reply(self) -> str:
         return (
-            "**Quick answer**\n\n"
             "I’m **CarCare AI** — a practical, safety-first assistant for drivers.\n\n"
-            "**What I help with**\n\n"
+            "## What I help with\n"
             "1. Maintenance basics and service intervals\n"
             "2. Safe troubleshooting when something feels wrong\n"
             "3. Understanding dashboard warnings and owner-manual-style guidance (when available)\n\n"
-            "**What to tell me**\n\n"
-            "- **Year / make / model**\n"
-            "- **Symptom** (noise, smell, light, leak, vibration)\n"
+            "## What to tell me\n"
+            "- The **symptom** (noise, smell, light, leak, vibration)\n"
             "- **When** it happens\n\n"
-            "**Important**\n\n"
+            "## Important\n"
+            "- I use the vehicle details your app sends; I won’t ask for year/make/model unless it’s missing.\n"
             "- I **don’t** have live sensor/OBD data unless your app sends it in context.\n"
             "- For **brake/steering failures**, **strong burning smells**, **smoke**, **overheating**, or **fuel odor**: "
             "**Do not continue driving** — get professional help.\n\n"
-            "**Next best action**\n\n"
+            "## Next best action\n"
             "What’s going on with your car today?"
         )
 
