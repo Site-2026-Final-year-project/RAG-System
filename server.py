@@ -21,7 +21,7 @@ from database import (
     ChatMessageModel,
     ChatSessionModel,
     SessionLocal,
-    ensure_postgres_chat_schema,
+    ensure_chat_schema,
     session_for_prisma_reads,
 )
 from scripts.chat import RAGAssistant
@@ -481,7 +481,7 @@ def get_owned_session_or_404(session_id: str, user_id: str) -> ChatSessionModel:
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    ensure_postgres_chat_schema()
+    ensure_chat_schema()
     yield
 
 
@@ -623,6 +623,7 @@ def send_message(
         session = db.get(ChatSessionModel, session_id)
         if session is None or session.user_id != user_id:
             raise HTTPException(status_code=404, detail="Session not found")
+        prev_summary = (getattr(session, "chat_summary", "") or "").strip()
 
         user_message = ChatMessageModel(
             id=str(uuid.uuid4()),
@@ -634,6 +635,18 @@ def send_message(
         db.add(user_message)
         db.commit()
         db.refresh(user_message)
+
+        # Last few messages for coherence (chronological).
+        recent_rows = list(
+            db.scalars(
+                select(ChatMessageModel)
+                .where(ChatMessageModel.session_id == session_id)
+                .order_by(desc(ChatMessageModel.created_at), desc(ChatMessageModel.id))
+                .limit(4)
+            ).all()
+        )
+        recent_rows = list(reversed(recent_rows))
+        recent_messages = [{"role": m.role, "content": m.content} for m in recent_rows]
 
     merged_vid = payload_vehicle_id or (session.vehicle_id or "").strip()
     short_ctx, detailed_ctx = resolve_context_hybrid(
@@ -666,6 +679,8 @@ def send_message(
             car_context=active_context,
             priority_context=detailed_ctx,
             manual_ids=manual_ids,
+            chat_summary=prev_summary,
+            recent_messages=recent_messages,
         )
     except RuntimeError as exc:
         # Typical on Render: local LLM weights failed to load (set LLM_PROVIDER=hf_space or RAG_REMOTE_LLM_URL).
@@ -693,6 +708,11 @@ def send_message(
             session_to_update.updated_at = utcnow()
             if active_context:
                 session_to_update.car_context = _shorten_context(active_context)
+            # Rolling summary: update once per assistant reply.
+            try:
+                session_to_update.chat_summary = assistant.update_chat_summary(prev_summary, text, answer)
+            except Exception:
+                pass
             if payload_vehicle_id:
                 session_to_update.vehicle_id = payload_vehicle_id
             elif merged_vid and not (session_to_update.vehicle_id or "").strip():

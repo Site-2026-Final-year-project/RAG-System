@@ -51,6 +51,8 @@ class ChatSessionModel(Base):
     user_id: Mapped[str] = mapped_column(String(128), index=True)
     title: Mapped[str] = mapped_column(String(255), default="New chat")
     car_context: Mapped[str] = mapped_column(String(255), default="")
+    # Rolling chat summary to keep long conversations coherent without sending full history every time.
+    chat_summary: Mapped[str] = mapped_column(Text, default="")
     # Links chat to Prisma Vehicle.id so every message can load maintenance health without client resending it.
     vehicle_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -192,16 +194,31 @@ def create_all_tables() -> None:
         )
 
 
-def ensure_postgres_chat_schema() -> None:
+def ensure_chat_schema() -> None:
     """
     SQLAlchemy create_all() does NOT add new columns to existing tables.
 
     Deployed DBs created before `vehicle_id` / composite indexes will 500 on every query unless we ALTER.
-    Safe to run repeatedly (IF NOT EXISTS).
+    Safe to run repeatedly (best-effort; we swallow "already exists" type errors).
     """
+    if DATABASE_URL.startswith("sqlite:"):
+        # SQLite dev DBs also need a best-effort ALTER when schema drifts.
+        ddl = [
+            "ALTER TABLE chat_sessions ADD COLUMN chat_summary TEXT DEFAULT ''",
+            "ALTER TABLE chat_sessions ADD COLUMN vehicle_id VARCHAR(36)",
+        ]
+        for stmt in ddl:
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(stmt))
+            except Exception:
+                # Older SQLite doesn't support IF NOT EXISTS; ignore duplicates/errors.
+                continue
+        return
     if not is_postgres_url(DATABASE_URL):
         return
     ddl = [
+        "ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS chat_summary TEXT DEFAULT ''",
         "ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS vehicle_id VARCHAR(36)",
         "CREATE INDEX IF NOT EXISTS ix_chat_sessions_vehicle_id ON chat_sessions (vehicle_id)",
         "CREATE INDEX IF NOT EXISTS ix_chat_sessions_user_updated ON chat_sessions (user_id, updated_at DESC)",
@@ -212,8 +229,8 @@ def ensure_postgres_chat_schema() -> None:
             with engine.begin() as conn:
                 conn.execute(text(stmt))
         except Exception as exc:
-            _log.warning("ensure_postgres_chat_schema failed (%s): %s", stmt[:96], exc)
+            _log.warning("ensure_chat_schema failed (%s): %s", stmt[:96], exc)
 
 
 create_all_tables()
-ensure_postgres_chat_schema()
+ensure_chat_schema()

@@ -7,7 +7,7 @@ import sys
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Sequence
+from typing import Dict, List, Sequence
 import re
 
 import requests
@@ -593,6 +593,7 @@ Answer:
 ADDITIONAL RESPONSE RULES
 - If the user asks who you are, what you are, or your name: answer as **CarCare AI** in plain language; **do not**
   paste unrelated numbered lists from manuals.
+- Avoid repetition: do not repeat the same sentence/bullet more than once.
 - Answer using the context below.
 - When context includes a Vehicle profile snapshot, treat those vehicle facts and percentages as authoritative.
 - Use manual excerpts as supporting detail for procedures and warnings.
@@ -610,10 +611,165 @@ Question:
 Answer:
 """.strip()
 
+    def _format_recent_messages(self, recent_messages: Sequence[Dict[str, str]] | None) -> str:
+        if not recent_messages:
+            return ""
+        lines: List[str] = []
+        for m in list(recent_messages)[-6:]:
+            role = (m.get("role") or "").strip().lower()
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            if role not in {"user", "assistant", "system"}:
+                role = "user"
+            clipped = content.replace("\n", " ").strip()
+            clipped = re.sub(r"\s+", " ", clipped)
+            if len(clipped) > 320:
+                clipped = clipped[:317].rstrip() + "..."
+            lines.append(f"{role}: {clipped}")
+        return "\n".join(lines).strip()
+
+    def _compose_conversation_prefix(
+        self,
+        *,
+        chat_summary: str = "",
+        recent_messages: Sequence[Dict[str, str]] | None = None,
+    ) -> str:
+        summary = (chat_summary or "").strip()
+        recent = self._format_recent_messages(recent_messages)
+        blocks: List[str] = []
+        if summary:
+            blocks.append(f"(Conversation summary so far)\n{summary[:1400]}")
+        if recent:
+            blocks.append(f"(Most recent messages)\n{recent}")
+        return "\n\n".join(blocks).strip()
+
+    def update_chat_summary(self, prev_summary: str, user_text: str, assistant_text: str) -> str:
+        """
+        Rolling summary for long chats.
+        Uses the configured LLM provider when available; falls back to a compact heuristic on failures.
+        """
+        prev = (prev_summary or "").strip()
+        u = (user_text or "").strip()
+        a = (assistant_text or "").strip()
+        if not u and not a:
+            return prev[:1400]
+
+        prompt = f"""
+You maintain a rolling conversation summary for a car-care assistant.
+
+Update the summary using the latest turn. Keep it short, factual, and useful for future replies.
+Preserve: vehicle identity (if mentioned), symptoms, warning lights, what was tried, conclusions, and next steps.
+Do NOT repeat yourself. Do NOT include long lists.
+
+Return plain text only (no markdown headings).
+Target length: 6-12 lines, <= 1200 characters.
+
+Previous summary:
+{prev if prev else "(empty)"}
+
+Latest turn:
+user: {u[:800]}
+assistant: {a[:1000]}
+
+Updated summary:
+""".strip()
+
+        try:
+            if self.llm_provider == "hf_space":
+                updated = self._hf_space_generate(prompt)
+            elif self.remote_llm_url:
+                updated = self._remote_generate(prompt)
+            else:
+                assert self.llm is not None
+                assert self.tokenizer is not None
+                inputs, input_len = self._tokenize_for_generation(prompt)
+                with torch.no_grad():
+                    outputs = self.llm.generate(
+                        **inputs,
+                        max_new_tokens=160,
+                        do_sample=False,
+                        temperature=1.0,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                    )
+                full_output = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                if "Updated summary:" in full_output:
+                    updated = full_output.split("Updated summary:")[-1].strip()
+                else:
+                    updated = self.tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+        except Exception:
+            # Heuristic fallback: keep a compact running log.
+            parts: List[str] = []
+            if prev:
+                parts.append(prev)
+            parts.append(f"User: {re.sub(r'\\s+', ' ', u)[:180]}")
+            parts.append(f"Assistant: {re.sub(r'\\s+', ' ', a)[:220]}")
+            updated = "\n".join(parts)
+
+        updated = re.sub(r"\s+\n", "\n", (updated or "").strip())
+        updated = "\n".join([ln.strip() for ln in updated.splitlines() if ln.strip()])
+        if len(updated) > 1200:
+            updated = updated[-1200:]
+        return updated.strip()
+
+    def _is_repetitive_output(self, text: str) -> bool:
+        lines = [re.sub(r"\s+", " ", ln.strip().lower()) for ln in text.splitlines() if ln.strip()]
+        if len(lines) < 6:
+            return False
+        counts: dict[str, int] = {}
+        for ln in lines:
+            counts[ln] = counts.get(ln, 0) + 1
+        top = max(counts.values(), default=1)
+        return top >= 4 or (top / max(1, len(lines))) >= 0.45
+
+    def _dedupe_bullets_and_lines(self, text: str) -> str:
+        out_lines: List[str] = []
+        seen: set[str] = set()
+        for ln in text.splitlines():
+            raw = ln.rstrip()
+            if not raw.strip():
+                # Keep at most one consecutive blank line
+                if out_lines and out_lines[-1].strip():
+                    out_lines.append("")
+                continue
+            key = re.sub(r"^\s*[-•\d]+\s*[\.\)]?\s*", "", raw).strip().lower()
+            key = re.sub(r"\s+", " ", key)
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            out_lines.append(raw)
+            if len(out_lines) >= 60:
+                break
+        return "\n".join(out_lines).strip()
+
+    def _burning_clarify_reply(self) -> str:
+        return (
+            "If you mean a **burning smell**, treat this as potentially urgent.\n\n"
+            "## Steps to follow\n"
+            "1. If you smell **burning**, see **smoke**, or any warning light: **pull over safely** and turn the engine off.\n"
+            "2. Keep the hood closed for a few minutes; then check **under the car** for leaks and look for smoke.\n"
+            "3. Don’t keep trying to drive it.\n\n"
+            "## What to check/prepare\n"
+            "- Is it a **burning smell** or the engine **overheating**?\n"
+            "- Does the engine **crank** (tries to start) or is it completely dead?\n"
+            "- Any **smoke** or **fluid leak**?\n\n"
+            "## When to seek a mechanic\n"
+            "- Immediately if there’s **smoke**, **fuel smell**, or overheating.\n\n"
+            "## Safety warning\n"
+            "**Do not continue driving** if there’s burning smell/smoke/overheating.\n\n"
+            "## Next best action\n"
+            "Reply with: **burning smell vs overheating**, and whether it **cranks** or **starts then stalls**."
+        )
+
     def _format_answer(self, text: str) -> str:
         raw = text.strip()
         if not raw:
             return "I am not certain based on the retrieved context."
+        raw = self._dedupe_bullets_and_lines(raw)
+        if self._is_repetitive_output(raw):
+            # Fallback: model is looping; ask a single clarifying question with safety-first guidance.
+            return self._burning_clarify_reply()
         lines = [" ".join(line.split()) for line in raw.splitlines()]
         cleaned = "\n".join(lines).strip()
         if not cleaned:
@@ -703,6 +859,8 @@ Answer:
         car_context: str = "",
         priority_context: str = "",
         manual_ids: Sequence[str] | None = None,
+        chat_summary: str = "",
+        recent_messages: Sequence[Dict[str, str]] | None = None,
     ) -> str:
         quick = self._quick_smalltalk(query)
         if quick is not None:
@@ -749,6 +907,12 @@ Answer:
             else "\n".join(context_chunks)
         )
         context = manual_block[:2500]
+        convo_prefix = self._compose_conversation_prefix(
+            chat_summary=chat_summary,
+            recent_messages=recent_messages,
+        )
+        if convo_prefix:
+            context = f"{convo_prefix}\n\n{context}".strip()
         if snap:
             context = (
                 f"(Vehicle profile snapshot — factual vehicle state)\n{snap[:2400]}\n\n"
